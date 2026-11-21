@@ -1,0 +1,196 @@
+# A value written to a column is converted to the type of the column as an
+# assignment cast. Each way of writing a value has a test, and a value with no
+# assignment cast to the column type fails with 42804.
+
+@database :memory:
+
+test insert-many-rows-with-no-cast-to-the-column-type {
+    CREATE TABLE t (ts timestamptz);
+    INSERT INTO t VALUES (20260101), (20260102);
+}
+@sqlstate 42804
+expect error {}
+
+test insert-many-rows-of-text-literals-into-an-integer-column {
+    CREATE TABLE t (n int);
+    INSERT INTO t VALUES ('1'), ('2');
+    SELECT n FROM t ORDER BY n;
+}
+expect {
+    1
+    2
+}
+
+test upsert-set-with-no-cast-to-the-column-type {
+    CREATE TABLE t (id int PRIMARY KEY, ts timestamptz);
+    INSERT INTO t VALUES (1, '2026-01-01Z');
+    INSERT INTO t VALUES (1, '2026-01-02Z') ON CONFLICT (id) DO UPDATE SET ts = 5;
+}
+@sqlstate 42804
+expect error {}
+
+test upsert-set-of-a-text-literal-into-an-integer-column {
+    CREATE TABLE t (id int PRIMARY KEY, n int);
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = '7';
+    SELECT n FROM t;
+}
+expect {
+    7
+}
+
+test update-set-of-a-text-literal-into-an-integer-column {
+    CREATE TABLE t (n int);
+    INSERT INTO t VALUES (1);
+    UPDATE t SET n = '7';
+    SELECT n FROM t;
+}
+expect {
+    7
+}
+
+test default-with-no-cast-to-the-column-type {
+    CREATE TABLE t (id int, ts timestamptz DEFAULT 5);
+    INSERT INTO t (id) VALUES (1);
+}
+@sqlstate 42804
+expect error {}
+
+test stored-generated-column-with-no-cast-to-the-column-type {
+    CREATE TABLE t (a int, g timestamptz GENERATED ALWAYS AS (5) STORED);
+    INSERT INTO t (a) VALUES (1);
+}
+@sqlstate 42804
+expect error {}
+
+test insert-boolean-expressions-into-a-boolean-column {
+    CREATE TABLE t (id int, b boolean);
+    INSERT INTO t VALUES
+        (1, 1 > 0), (2, 1 IS NULL), (3, NOT true), (4, 2 BETWEEN 1 AND 3),
+        (5, 1 IN (1, 2)), (6, 'x' LIKE 'x'), (7, EXISTS (SELECT 1)), (8, true AND false),
+        (9, 'a' ~* 'A'), (10, 'abc' SIMILAR TO 'a%'), (11, ARRAY[1] && ARRAY[1]);
+    SELECT id, b FROM t ORDER BY id;
+}
+expect {
+    1|t
+    2|f
+    3|f
+    4|t
+    5|t
+    6|t
+    7|t
+    8|f
+    9|t
+    10|t
+    11|t
+}
+
+test insert-select-a-comparison-into-a-boolean-column {
+    CREATE TABLE s (a int);
+    INSERT INTO s VALUES (1), (9);
+    CREATE TABLE t (b boolean);
+    INSERT INTO t SELECT a > 5 FROM s;
+    SELECT b FROM t ORDER BY b;
+}
+expect {
+    f
+    t
+}
+
+test update-sets-a-boolean-column-from-a-comparison {
+    CREATE TABLE t (a int, b boolean);
+    INSERT INTO t VALUES (1, true);
+    UPDATE t SET b = (a > 5);
+    SELECT b FROM t;
+}
+expect {
+    f
+}
+
+test update-toggles-a-boolean-column {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (true);
+    UPDATE t SET b = NOT b;
+    SELECT b FROM t;
+}
+expect {
+    f
+}
+
+test boolean-default-expression {
+    CREATE TABLE t (id int, b boolean DEFAULT (1 > 0));
+    INSERT INTO t (id) VALUES (1);
+    SELECT b FROM t;
+}
+expect {
+    t
+}
+
+test text-cast-of-a-comparison {
+    SELECT (1 > 0)::text;
+}
+expect {
+    true
+}
+
+test an-integer-is-not-a-boolean-on-assignment {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES (1);
+}
+@sqlstate 42804
+expect error {}
+
+test a-text-literal-is-read-as-a-boolean-on-assignment {
+    CREATE TABLE t (b boolean);
+    INSERT INTO t VALUES ('yes'), ('f');
+    SELECT b FROM t ORDER BY b;
+}
+expect {
+    f
+    t
+}
+
+test insert-a-boolean-into-a-text-column {
+    CREATE TABLE t (t text);
+    INSERT INTO t VALUES (true), (1 > 2);
+    UPDATE t SET t = (2 > 1) WHERE t = 'false';
+    SELECT t FROM t;
+}
+expect {
+    true
+    true
+}
+
+test insert-select-from-another-table-casts-a-boolean-to-text {
+    CREATE TABLE s (x boolean);
+    INSERT INTO s VALUES (true);
+    CREATE TABLE t (t text);
+    INSERT INTO t SELECT x FROM s;
+    SELECT t FROM t;
+}
+expect {
+    true
+}
+
+test insert-select-from-the-target-casts-an-integer-to-numeric {
+    CREATE TABLE q (i int, n numeric(5,2));
+    INSERT INTO q VALUES (7, 1);
+    INSERT INTO q (n) SELECT i FROM q;
+    SELECT n FROM q ORDER BY n;
+}
+expect {
+    1.00
+    7.00
+}
+
+test insert-select-a-numeric-with-a-scale-into-an-integer-column {
+    CREATE TABLE n (y numeric(10,2));
+    INSERT INTO n VALUES (3), (2.5);
+    CREATE TABLE t (c int);
+    INSERT INTO t SELECT y FROM n;
+    SELECT c FROM t ORDER BY c;
+}
+expect {
+    3
+    3
+}

@@ -11,7 +11,7 @@ use turso_core::ast;
 use turso_core::dialect::{AppliedCast, CastContext, CastSource};
 use turso_core::{LimboError, Numeric, Register, Result, Value};
 use turso_pg_parser::sqlstate::{
-    SQLSTATE_CANNOT_COERCE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    SQLSTATE_CANNOT_COERCE, SQLSTATE_DATATYPE_MISMATCH, SQLSTATE_INVALID_TEXT_REPRESENTATION,
     SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
 };
 
@@ -63,6 +63,16 @@ impl CastType {
             "timestamptz" => Self::TimestampTz,
             _ => return None,
         })
+    }
+
+    /// FIXME(pg-catalog): This hand-codes which PostgreSQL type a column has from the SQLite type name the schema keeps, so an int4 or float4 column is only checked for the range of int8 or float8. The atttypid of the column in pg_attribute, looked up in pg_type, replaces this.
+    /// The type of a column, which the schema keeps by its SQLite type name.
+    fn from_column_type(name: &str) -> Option<Self> {
+        match name {
+            "integer" => Some(Self::Int8),
+            "real" => Some(Self::Float8),
+            _ => Self::from_name(name),
+        }
     }
 
     fn is_integer(self) -> bool {
@@ -151,11 +161,21 @@ fn resolve(source: CastType, target: CastType, context: CastContext) -> Result<R
     if listed || through_text {
         return Ok(Resolution::Convert);
     }
-    Err(sqlstate_error(
-        SQLSTATE_CANNOT_COERCE,
-        format!("cannot cast type {} to {}", source.name(), target.name()),
-        None,
-    ))
+    let (sqlstate, message) = match context {
+        CastContext::Assignment => (
+            SQLSTATE_DATATYPE_MISMATCH,
+            format!(
+                "a value of type {} cannot be assigned to type {}",
+                source.name(),
+                target.name()
+            ),
+        ),
+        _ => (
+            SQLSTATE_CANNOT_COERCE,
+            format!("cannot cast type {} to {}", source.name(), target.name()),
+        ),
+    };
+    Err(sqlstate_error(sqlstate, message, None))
 }
 
 /// The cast PostgreSQL does for a CAST of `operand` to `target`, or None for a
@@ -167,21 +187,26 @@ pub(crate) fn apply_cast(
     target: &ast::Type,
     context: CastContext,
 ) -> Result<Option<AppliedCast>> {
-    if context != CastContext::Explicit || target.array_dimensions > 0 {
+    if target.array_dimensions > 0 {
         return Ok(None);
     }
-    let Some(target_type) = CastType::from_name(&target.name.to_ascii_lowercase()) else {
+    let target_name = target.name.to_ascii_lowercase();
+    let target_type = match context {
+        CastContext::Assignment => CastType::from_column_type(&target_name),
+        _ => CastType::from_name(&target_name),
+    };
+    let Some(target_type) = target_type else {
         return Ok(None);
     };
-    let source_type = match source() {
-        CastSource::Untyped => Text,
+    let (source_type, context) = match source() {
+        CastSource::Untyped => (Text, CastContext::Explicit),
         CastSource::Typed(source) => match source_type(&source) {
-            Some(source_type) => source_type,
+            Some(source_type) => (source_type, context),
             None => return Ok(None),
         },
         CastSource::Unnamed => return Ok(None),
     };
-    let operand = match resolve(source_type, target_type, context.into())? {
+    let operand = match resolve(source_type, target_type, context)? {
         Resolution::Convert if needs_conversion(source_type, target_type) => {
             conversion_call(operand, source_type, target_type)
         }
