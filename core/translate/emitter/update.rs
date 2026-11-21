@@ -1057,16 +1057,46 @@ fn emit_deferred_notnull_checks<'a>(
     Ok(())
 }
 
-/// Check the new values of the SET columns against their declared types, before
-/// custom type encoding.
+/// The source of the new value of each column of the table. `set_values`
+/// gives the column index and the expression of each SET item.
+pub(crate) fn set_value_sources<'e>(
+    btree: &BTreeTable,
+    table_references: &TableReferences,
+    set_values: impl Iterator<Item = (usize, &'e ast::Expr)>,
+    resolver: &Resolver,
+) -> Vec<crate::dialect::CastSource> {
+    let env = crate::translate::expr::expr_type::TypeEnv::new(Some(table_references), resolver);
+    let mut sources = vec![crate::dialect::CastSource::Unnamed; btree.columns().len()];
+    for (column_index, expr) in set_values {
+        if let Some(source) = sources.get_mut(column_index) {
+            *source =
+                crate::translate::expr::expr_type::cast_source_of(expr, &env, resolver.schema());
+        }
+    }
+    sources
+}
+
+/// Converts the new values of the SET columns to the types of their columns,
+/// as the dialect does a cast on assignment, then checks them against their
+/// declared types, before custom type encoding.
 fn emit_input_type_check(
     program: &mut ProgramBuilder,
     btree: &Arc<BTreeTable>,
     start: usize,
     layout: &ColumnLayout,
     updated_column_indices: &ColumnMask,
+    sources: &[crate::dialect::CastSource],
     resolver: &Resolver,
 ) -> crate::Result<()> {
+    crate::translate::expr::emit_assignment_casts(
+        program,
+        resolver,
+        btree.columns(),
+        start,
+        Some(updated_column_indices),
+        layout,
+        &crate::translate::expr::ColumnSources::Typed(sources),
+    )?;
     program.emit_insn(Insn::TypeCheck {
         start_reg: start,
         count: layout.num_non_virtual_cols(),
@@ -1459,6 +1489,12 @@ fn emit_update_insns<'a>(
                         start,
                         &layout,
                         &user_value_columns,
+                        &set_value_sources(
+                            &btree_table,
+                            table_references,
+                            set_clauses.iter().map(|c| (c.column_index, &*c.expr)),
+                            &t_ctx.resolver,
+                        ),
                         &t_ctx.resolver,
                     )?;
                 }
@@ -1625,6 +1661,12 @@ fn emit_update_insns<'a>(
                 start,
                 &layout,
                 &user_value_columns,
+                &set_value_sources(
+                    btree,
+                    table_references,
+                    set_clauses.iter().map(|c| (c.column_index, &*c.expr)),
+                    &t_ctx.resolver,
+                ),
                 &t_ctx.resolver,
             )?;
         }

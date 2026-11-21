@@ -50,14 +50,15 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    translate_select_with_source(
+    let (num_result_cols, _) = translate_select_with_source(
         select,
         resolver,
         program,
         query_destination,
         connection,
         false,
-    )
+    )?;
+    Ok(num_result_cols)
 }
 
 /// [translate_select] for the rows of `INSERT INTO t VALUES (...), (...)`. An
@@ -69,7 +70,7 @@ pub fn translate_insert_source_select(
     program: &mut ProgramBuilder,
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
-) -> Result<usize> {
+) -> Result<(usize, Vec<crate::dialect::CastSource>)> {
     translate_select_with_source(
         select,
         resolver,
@@ -88,7 +89,7 @@ fn translate_select_with_source(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
     is_insert_source: bool,
-) -> Result<usize> {
+) -> Result<(usize, Vec<crate::dialect::CastSource>)> {
     let plan = prepare_select_plan_from_arms(
         select.body.select,
         select.body.compounds,
@@ -107,7 +108,20 @@ fn translate_select_with_source(
             crate::bail_parse_error!("unsafe use of virtual table \"{}\"", virtual_table);
         }
     }
-    emit_select_plan(plan, resolver, program, connection)
+    let sources = match is_insert_source {
+        true => {
+            let (_, types) = crate::translate::plan::query_output_columns(&plan, None, resolver)?;
+            types
+                .into_iter()
+                .map(|ty| {
+                    crate::translate::expr::expr_type::dialect_cast_source(ty, resolver.schema())
+                })
+                .collect()
+        }
+        false => Vec::new(),
+    };
+    let num_result_cols = emit_select_plan(plan, resolver, program, connection)?;
+    Ok((num_result_cols, sources))
 }
 
 /// Optimize and emit bytecode for an already-prepared select plan.

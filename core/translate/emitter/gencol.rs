@@ -139,7 +139,12 @@ fn emit_generated_columns(
                 translate_expr(program, None, expr, target_reg, resolver)?;
             }
             if stores_value {
-                emit_virtual_column_store(program, resolver, column, target_reg, table)?;
+                let source = crate::translate::expr::expr_type::cast_source_of(
+                    expr,
+                    &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+                    resolver.schema(),
+                );
+                emit_virtual_column_store(program, resolver, column, target_reg, table, source)?;
             }
             program.emit_column_affinity(target_reg, column.affinity());
         }
@@ -160,10 +165,20 @@ pub(crate) fn emit_virtual_column_store(
     column: &Column,
     reg: usize,
     table: &BTreeTable,
+    source: crate::dialect::CastSource,
 ) -> Result<()> {
     if !table.is_strict {
         return Ok(());
     }
+    crate::translate::expr::emit_assignment_casts(
+        program,
+        resolver,
+        std::slice::from_ref(column),
+        reg,
+        None,
+        &ColumnLayout::Identity { column_count: 1 },
+        &crate::translate::expr::ColumnSources::Typed(&[source]),
+    )?;
     emit_custom_type_encode_columns(
         program,
         resolver,

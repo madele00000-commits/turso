@@ -93,8 +93,8 @@ pub(crate) use affinity::{
     StorageClassMask,
 };
 pub(crate) use arrays::{
-    emit_array_decode, emit_array_leaf_loop, emit_custom_type_decode_columns,
-    emit_custom_type_encode_columns, ArrayInput,
+    emit_array_decode, emit_array_leaf_loop, emit_assignment_casts,
+    emit_custom_type_decode_columns, emit_custom_type_encode_columns, ArrayInput, ColumnSources,
 };
 pub(crate) use binary::{row_value_component_expr, row_value_len};
 pub(crate) use binding::check_custom_types;

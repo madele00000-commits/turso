@@ -1258,6 +1258,23 @@ pub(crate) fn common_type<'e>(
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
 }
 
+/// The source of a value read from a column of the type `column_type`.
+pub(crate) fn cast_source_of_column_type(column: &Column) -> CastSource {
+    if column.ty_str.is_empty() {
+        return CastSource::Unnamed;
+    }
+    CastSource::Typed(ast::Type {
+        name: column.ty_str.clone(),
+        size: None,
+        array_dimensions: column.array_dimensions(),
+    })
+}
+
+/// The source of a value that is the result of `expr`, as a dialect sees it.
+pub(crate) fn cast_source_of(expr: &ast::Expr, env: &TypeEnv, schema: &Schema) -> CastSource {
+    dialect_cast_source(type_of(expr, env), schema)
+}
+
 /// The type of a cast operand as a dialect sees it.
 pub(crate) fn dialect_cast_source(ty: ExprType, schema: &Schema) -> CastSource {
     let named = |name: &str, array_dimensions: u32| {

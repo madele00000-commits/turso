@@ -1,4 +1,5 @@
 use super::*;
+use crate::dialect::CastSource;
 use crate::function::{AccumulatorFunc, AggFunc};
 use crate::types::StrictType;
 use crate::vdbe::insn::{AggStepData, ArrayEncodeData, ArrayEncodeTarget};
@@ -334,6 +335,67 @@ fn resolve_array_element_type(
             col.ty_str
         ))),
     }
+}
+
+/// The cast source of each column in a statement that writes values to a
+/// table. A column whose value has no known source type is `Unnamed`.
+pub(crate) enum ColumnSources<'a> {
+    Unnamed,
+    Typed(&'a [CastSource]),
+}
+
+impl ColumnSources<'_> {
+    fn of(&self, column: usize) -> CastSource {
+        match self {
+            Self::Unnamed => CastSource::Unnamed,
+            Self::Typed(sources) => sources.get(column).cloned().unwrap_or(CastSource::Unnamed),
+        }
+    }
+}
+
+/// Converts the values in a contiguous register range to the types of their
+/// columns as the dialect does a cast on assignment. It runs before the
+/// check of the input types, which needs the converted values.
+pub(crate) fn emit_assignment_casts(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    columns: &[Column],
+    start_reg: usize,
+    only_columns: Option<&ColumnMask>,
+    layout: &ColumnLayout,
+    sources: &ColumnSources,
+) -> Result<()> {
+    for (i, col) in columns.iter().enumerate() {
+        if only_columns.is_some_and(|filter| !filter.get(i)) {
+            continue;
+        }
+        if col.is_array() || col.ty_str.is_empty() {
+            continue;
+        }
+        let reg = layout.to_register(start_reg, i);
+        let target = ast::Type {
+            name: col.ty_str.clone(),
+            size: None,
+            array_dimensions: 0,
+        };
+        let applied = resolver.catalog.dialect.apply_cast(
+            &ast::Expr::register(reg),
+            &|| sources.of(i),
+            &target,
+            crate::dialect::CastContext::Assignment,
+        )?;
+        if let Some(applied) = applied {
+            translate_expr_no_constant_opt(
+                program,
+                None,
+                &applied.operand,
+                reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Emit ENCODE and COERCE for columns with custom types in a contiguous register range.

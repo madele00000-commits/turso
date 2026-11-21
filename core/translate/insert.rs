@@ -184,6 +184,8 @@ pub struct InsertEmitCtx<'a> {
     /// when a DO UPDATE must fail on such a row (see
     /// [crate::Dialect::upsert_rejects_row_written_by_same_statement]).
     pub written_rowids_cursor_id: Option<usize>,
+    /// The source type of each value of a row, in the order of the values.
+    pub value_sources: Vec<crate::dialect::CastSource>,
 }
 
 impl<'a> InsertEmitCtx<'a> {
@@ -240,6 +242,7 @@ impl<'a> InsertEmitCtx<'a> {
             namespace,
             returning_buffer: None,
             written_rowids_cursor_id: None,
+            value_sources: Vec::new(),
         })
     }
 }
@@ -848,6 +851,8 @@ pub fn translate_insert(
     }
     if let Some(type_check_table) = &maybe_type_check_table {
         if !program.flags.writes_stored_values() {
+            emit_insert_assignment_casts(program, resolver, &insertion, &ctx.value_sources)?;
+
             // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
             // to catch things like a TEXT value inserted into an INTEGER-based custom type.
             program.emit_insn(Insn::TypeCheck {
@@ -2540,7 +2545,7 @@ fn init_source_emission<'a>(
                     yield_reg,
                     coroutine_implementation_start: ctx.halt_label,
                 };
-                let num_result_cols = program.nested(|program| {
+                let (num_result_cols, value_sources) = program.nested(|program| {
                     translate_insert_source_select(
                         select,
                         resolver,
@@ -2549,6 +2554,7 @@ fn init_source_emission<'a>(
                         connection,
                     )
                 })?;
+                ctx.value_sources = value_sources;
                 if num_result_cols != required_column_count {
                     crate::bail_parse_error!(
                         "table {} has {required_column_count} columns but {} values were supplied",
@@ -2720,6 +2726,15 @@ fn init_source_emission<'a>(
     };
     ctx.num_values = num_values;
     ctx.cursor_id = cursor_id;
+    if ctx.yield_reg_opt.is_none() {
+        let env = crate::translate::expr::expr_type::TypeEnv::new(None, resolver);
+        ctx.value_sources = values
+            .iter()
+            .map(|value| {
+                crate::translate::expr::expr_type::cast_source_of(value, &env, resolver.schema())
+            })
+            .collect();
+    }
     Ok(())
 }
 
@@ -3022,7 +3037,7 @@ fn translate_rows_multiple<'short, 'long: 'short>(
         program.preassign_label_to_next_insn(temp_table_ctx.loop_start_label);
     }
     let translate_value_fn =
-        |prg: &mut ProgramBuilder, value_index: usize, column_register: usize| {
+        |prg: &mut ProgramBuilder, value_index: usize, column_register: usize, _column: &Column| {
             if let Some(temp_table_ctx) = temp_table_ctx {
                 prg.emit_insn(Insn::Column {
                     cursor_id: temp_table_ctx.cursor_id,
@@ -3050,7 +3065,7 @@ fn translate_rows_single(
     is_strict: bool,
 ) -> Result<()> {
     let translate_value_fn =
-        |prg: &mut ProgramBuilder, value_index: usize, column_register: usize| -> Result<()> {
+        |prg: &mut ProgramBuilder, value_index: usize, column_register: usize, _column: &Column| {
             translate_expr_no_constant_opt(
                 prg,
                 None,
@@ -3074,7 +3089,7 @@ fn translate_rows_single(
 fn translate_rows_base<'short, 'long: 'short>(
     program: &mut ProgramBuilder,
     insertion: &'short Insertion<'long>,
-    mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
+    mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize, &Column) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
 ) -> Result<()> {
@@ -3110,7 +3125,7 @@ fn translate_rows_base<'short, 'long: 'short>(
 fn translate_key(
     program: &mut ProgramBuilder,
     insertion: &Insertion,
-    mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
+    mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize, &Column) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
 ) -> Result<()> {
@@ -3145,7 +3160,7 @@ fn translate_column(
     column: &Column,
     column_register: usize,
     value_index: Option<usize>,
-    translate_value_fn: &mut impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
+    translate_value_fn: &mut impl FnMut(&mut ProgramBuilder, usize, usize, &Column) -> Result<()>,
     resolver: &Resolver,
     is_strict: bool,
 ) -> Result<()> {
@@ -3159,7 +3174,7 @@ fn translate_column(
             .cloned();
         let prev = program.target_union_type.take();
         program.target_union_type = union_td;
-        let result = translate_value_fn(program, value_index, column_register);
+        let result = translate_value_fn(program, value_index, column_register, column);
         program.target_union_type = prev;
         result?;
     } else if column.is_generated() {
@@ -4551,6 +4566,56 @@ pub fn emit_parent_side_fk_decrement_on_insert(
         program.preassign_label_to_next_insn(skip_fk);
     }
     Ok(())
+}
+
+/// Converts the values of the row to the types of their columns, as the
+/// dialect does a cast on assignment.
+fn emit_insert_assignment_casts(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+    value_sources: &[crate::dialect::CastSource],
+) -> Result<()> {
+    let columns: Vec<_> = insertion
+        .col_mappings
+        .iter()
+        .map(|m| m.column.clone())
+        .collect();
+    let layout = ColumnLayout::from_columns(&columns)?;
+    let stored_columns = ColumnMask::try_from_iter(
+        columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| !column.is_generated())
+            .map(|(i, _)| i),
+    )?;
+    let sources: Vec<_> = insertion
+        .col_mappings
+        .iter()
+        .map(|mapping| match mapping.value_index {
+            Some(index) => value_sources
+                .get(index)
+                .cloned()
+                .unwrap_or(crate::dialect::CastSource::Unnamed),
+            None => {
+                let default = column_default_expr(mapping.column, true, resolver);
+                crate::translate::expr::expr_type::cast_source_of(
+                    &default,
+                    &crate::translate::expr::expr_type::TypeEnv::new(None, resolver),
+                    resolver.schema(),
+                )
+            }
+        })
+        .collect();
+    crate::translate::expr::emit_assignment_casts(
+        program,
+        resolver,
+        &columns,
+        insertion.first_col_register(),
+        Some(&stored_columns),
+        &layout,
+        &crate::translate::expr::ColumnSources::Typed(&sources),
+    )
 }
 
 /// Emit encode expressions for columns with custom types.

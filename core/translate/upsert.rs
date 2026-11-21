@@ -827,6 +827,25 @@ pub fn emit_upsert(
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
+            let set_columns: ColumnMask = set_pairs
+                .iter()
+                .map(|(col_idx, _)| *col_idx)
+                .try_collect()?;
+            let sources = crate::translate::emitter::update::set_value_sources(
+                &bt,
+                table_references,
+                set_pairs.iter().map(|(col_idx, expr)| (*col_idx, &**expr)),
+                resolver,
+            );
+            crate::translate::expr::emit_assignment_casts(
+                program,
+                resolver,
+                bt.columns(),
+                new_start,
+                Some(&set_columns),
+                &layout,
+                &crate::translate::expr::ColumnSources::Typed(&sources),
+            )?;
             // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
             // We need to do this before regenerating virtual columns, because TypeCheck applies
             // affinity in-place to its registers, which could affect virtual columns.

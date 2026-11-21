@@ -502,6 +502,15 @@ fn emit_column_constraints_validation(
                 dst_reg: store_reg,
                 extra_amount: 0,
             });
+            crate::translate::expr::emit_assignment_casts(
+                program,
+                resolver,
+                std::slice::from_ref(column),
+                store_reg,
+                None,
+                &ColumnLayout::Identity { column_count: 1 },
+                &crate::translate::expr::ColumnSources::Unnamed,
+            )?;
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 resolver,
@@ -2606,6 +2615,22 @@ fn emit_strict_column_conversion(
             reg: layout.to_register(start_reg, column_index),
         });
     }
+    let mut sources = vec![crate::dialect::CastSource::Unnamed; rewritten_table.columns().len()];
+    if let (Some(original), Some(source)) = (
+        original_table.columns().get(column_index),
+        sources.get_mut(column_index),
+    ) {
+        *source = crate::translate::expr::expr_type::cast_source_of_column_type(original);
+    }
+    crate::translate::expr::emit_assignment_casts(
+        program,
+        resolver,
+        rewritten_table.columns(),
+        start_reg,
+        Some(&column_mask),
+        layout,
+        &crate::translate::expr::ColumnSources::Typed(&sources),
+    )?;
     program.emit_insn(Insn::TypeCheck {
         start_reg,
         count: layout.num_non_virtual_cols(),
