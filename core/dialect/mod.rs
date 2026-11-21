@@ -657,6 +657,47 @@ pub trait Dialect: Send + Sync + 'static {
     fn json_contains_function(&self) -> Option<&'static str> {
         None
     }
+
+    /// Applies a cast of `operand` to the type `target`, as written. None
+    /// leaves the cast to the engine's own rules. Some is final: the engine
+    /// casts the returned operand to the returned type and does nothing else.
+    /// `source` gives the type of the operand, and is only called by a dialect
+    /// that needs it.
+    fn apply_cast(
+        &self,
+        _operand: &ast::Expr,
+        _source: &dyn Fn() -> CastSource,
+        _target: &ast::Type,
+        _context: CastContext,
+    ) -> Result<Option<AppliedCast>> {
+        Ok(None)
+    }
+}
+
+/// Where a cast is written, from the narrowest to the widest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CastContext {
+    Implicit,
+    Assignment,
+    Explicit,
+}
+
+/// What is known about the type of a cast operand.
+#[derive(Debug, Clone)]
+pub enum CastSource {
+    /// A string literal or a parameter. Its type comes from where it is used.
+    Untyped,
+    Typed(ast::Type),
+    /// A value that nothing declares a type for, such as NULL.
+    Unnamed,
+}
+
+/// The result of `Dialect::apply_cast`: the operand to cast, which may be
+/// wrapped in a conversion, and the type the engine casts it to.
+#[derive(Debug, Clone)]
+pub struct AppliedCast {
+    pub operand: ast::Expr,
+    pub target: ast::Type,
 }
 
 /// How an ORDER BY or DISTINCT ON term is matched to the output columns.

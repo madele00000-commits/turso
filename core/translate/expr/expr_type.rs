@@ -9,6 +9,7 @@ use crate::ast;
 
 use super::custom_type_operators::find_operator_call;
 use super::get_expr_affinity;
+use crate::dialect::CastSource;
 use crate::function::{AggFunc, Func, ResultType, ReturnType, ScalarFunc, WindowFunc};
 use crate::schema::{BTreeTable, Column, Schema, Table, TypeDef};
 use crate::sync::Arc;
@@ -1255,6 +1256,35 @@ pub(crate) fn common_type<'e>(
     env: &TypeEnv,
 ) -> ExprType {
     common_of_types(exprs.map(|expr| type_of(expr, env)), env.schema())
+}
+
+/// The type of a cast operand as a dialect sees it.
+pub(crate) fn dialect_cast_source(ty: ExprType, schema: &Schema) -> CastSource {
+    let named = |name: &str, array_dimensions: u32| {
+        CastSource::Typed(ast::Type {
+            name: name.to_string(),
+            size: None,
+            array_dimensions,
+        })
+    };
+    match without_domain(ty, schema) {
+        ExprType::Builtin(BuiltinType::Any) | ExprType::Untyped => CastSource::Untyped,
+        ExprType::Builtin(BuiltinType::Decimal | BuiltinType::Numeric) => named("NUMERIC", 0),
+        ExprType::Builtin(BuiltinType::Boolean) => match schema.type_of_conditions() {
+            Some(type_def) => named(&type_def.name, 0),
+            None => named(BuiltinType::Boolean.sqlite_name(), 0),
+        },
+        ExprType::Builtin(builtin) => named(builtin.sqlite_name(), 0),
+        ExprType::Custom { type_def, .. } => named(&type_def.name, 0),
+        ExprType::Array {
+            element,
+            dimensions,
+        } => match dialect_cast_source(*element, schema) {
+            CastSource::Typed(element) => named(&element.name, dimensions),
+            other => other,
+        },
+        _ => CastSource::Unnamed,
+    }
 }
 
 fn common_of_types(types: impl Iterator<Item = ExprType>, schema: &Schema) -> ExprType {

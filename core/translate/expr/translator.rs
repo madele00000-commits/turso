@@ -858,11 +858,28 @@ fn translate_cast_expr(
     let ast::Expr::Cast { expr, type_name } = expr else {
         unreachable!("translate_cast_expr expects Expr::Cast");
     };
+    let applied = apply_dialect_cast(
+        referenced_tables,
+        expr,
+        type_name.as_ref(),
+        crate::dialect::CastContext::Explicit,
+        resolver,
+    )?;
+    let (operand, type_name) = match &applied {
+        Some(applied) => (&applied.operand, Some(&applied.target)),
+        None => (&**expr, type_name.as_ref()),
+    };
     // A CAST to a custom type gives the value a column of the type reads, after
     // ENCODE and then DECODE, so that operators, functions and comparisons see
     // both alike: `CAST(42 AS cents)` is 42, and `-CAST(1.5 AS numeric(10,2))`
     // runs numeric's `-` on 1.50.
-    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+    translate_expr(
+        program,
+        referenced_tables,
+        operand,
+        target_register,
+        resolver,
+    )?;
 
     if let Some(tn) = type_name {
         let source = type_of(expr, &TypeEnv::new(referenced_tables, resolver));
@@ -938,6 +955,29 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+/// The cast the dialect applies to the operand, or None when the dialect
+/// leaves the CAST to the engine.
+pub(crate) fn apply_dialect_cast(
+    referenced_tables: Option<&TableReferences>,
+    operand: &ast::Expr,
+    type_name: Option<&ast::Type>,
+    context: crate::dialect::CastContext,
+    resolver: &Resolver,
+) -> Result<Option<crate::dialect::AppliedCast>> {
+    let Some(type_name) = type_name else {
+        return Ok(None);
+    };
+    use super::expr_type::dialect_cast_source;
+    let source = || {
+        let ty = type_of(operand, &TypeEnv::new(referenced_tables, resolver));
+        dialect_cast_source(ty, resolver.schema())
+    };
+    resolver
+        .catalog
+        .dialect
+        .apply_cast(operand, &source, type_name, context)
 }
 
 /// Emits a CAST of the value in `reg` to the custom type `type_name`, whose
