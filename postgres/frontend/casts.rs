@@ -48,6 +48,10 @@ impl CastType {
         }
     }
 
+    pub(crate) fn oid(self) -> i64 {
+        crate::catalog::pg_type_oid(self.name()).expect("every cast type has a pg_type oid")
+    }
+
     fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "int2" | "smallint" => Self::Int2,
@@ -143,6 +147,29 @@ const CASTS: &[Cast] = &[
     cast(Timestamp, TimestampTz, I),
     cast(TimestampTz, Timestamp, A),
 ];
+
+/// The `oid` of the first row of `pg_cast`.
+pub(crate) const FIRST_CAST_OID: i64 = 10_000;
+
+/// The rows of `pg_cast`: source, target, the letter of the context and the
+/// letter of the method. A cast from or to text goes through the text input
+/// or output function, and the others through a conversion function.
+pub(crate) fn cast_rows() -> impl Iterator<Item = (CastType, CastType, &'static str, &'static str)>
+{
+    CASTS.iter().map(|cast| {
+        let context = match cast.context {
+            CastContext::Implicit => "i",
+            CastContext::Assignment => "a",
+            CastContext::Explicit => "e",
+        };
+        let method = if cast.source == Text || cast.target == Text {
+            "i"
+        } else {
+            "f"
+        };
+        (cast.source, cast.target, context, method)
+    })
+}
 
 enum Resolution {
     Unchanged,
