@@ -46,6 +46,7 @@ use crate::{
             NonFromClauseSubquery, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
             SubqueryEvalPhase, SubqueryOrigin, SubqueryState, UpdateSetClause, WriteSetPlan,
         },
+        subquery::mark_shared_cte_materialization_requirements,
         trigger_exec::has_triggers_including_temp,
     },
     types::SeekOp,
@@ -619,6 +620,9 @@ pub fn optimize_plan(
     resolver: &Resolver,
     connection: &crate::Connection,
 ) -> Result<()> {
+    // Every statement is optimized here once its planning is complete, so this
+    // is where all CTE reads of the statement are known.
+    mark_shared_cte_materialization_requirements(plan);
     let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,

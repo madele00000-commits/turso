@@ -26,6 +26,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN employees
 |--SCAN employee_salaries AS e1
+|  `--SCAN employees
 `--SEARCH e2 USING INDEX ephemeral_subquery_t4 (department=? AND id>?)
+   `--SCAN employees

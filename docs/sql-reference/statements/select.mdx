@@ -471,6 +471,15 @@ WHERE total_sales > 100000
 ORDER BY total_sales DESC;
 ```
 
+As in SQLite, a CTE that the statement reads more than once is computed once for the statement, and the reads share the same rows, unless SQLite would merge the CTE's query into the query that reads it. A merged read computes the CTE again. SQLite merges a CTE's query unless it has no `FROM` clause, or uses an aggregate, `DISTINCT`, a window function, `OFFSET`, `VALUES`, or a compound other than `UNION ALL`. A CTE query with a `LIMIT` is also kept apart from a reading query that is a compound arm, or that has a `WHERE` clause, an aggregate, `DISTINCT`, its own `LIMIT`, or more than one table in its `FROM` clause. This includes reads in subqueries and in the arms of a compound SELECT. A CTE marked `MATERIALIZED` is always computed once. A CTE marked `NOT MATERIALIZED` is computed again for each read, except that reads in the same `FROM` clause share one result.
+
+```sql
+WITH c(x) AS (SELECT random())
+SELECT x FROM c UNION SELECT x FROM c;   -- one row
+```
+
+A subquery in the `RETURNING` clause of an `INSERT`, `UPDATE` or `DELETE` runs after the write. It reuses the CTE result only when a read before the write stored it, as described above, including a read in the `SELECT` of an `INSERT ... SELECT`. Otherwise it computes the CTE again and sees the written rows, as in SQLite. The `RETURNING` subqueries of a statement share one CTE result among themselves, even a single subquery that reads a column of the written row: it reads the same result for every row. The subqueries in the `DO UPDATE` of an upsert share one result among themselves too, and reuse a result that the `SELECT` of the `INSERT` stored, but do not share one with `RETURNING`.
+
 ### Multiple CTEs
 
 ```sql
