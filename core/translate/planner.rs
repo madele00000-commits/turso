@@ -2110,6 +2110,21 @@ fn parse_table(
         if let Some(outer_ref) =
             table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
         {
+            // A read of the CTE in the FROM clause of an outer query holds a
+            // plan of its body, which this read would share. Plan the body
+            // again from its definition, as SQLite copies it for each read, so
+            // that the CTEs of a WITH clause inside the body get new ids.
+            let outer_ref = if outer_ref.cte_select.is_none() && outer_ref.cte_id.is_some() {
+                table_references
+                    .outer_query_refs()
+                    .iter()
+                    .find(|reference| {
+                        reference.cte_id == outer_ref.cte_id && reference.cte_select.is_some()
+                    })
+                    .unwrap_or(outer_ref)
+            } else {
+                outer_ref
+            };
             if !args.is_empty() {
                 if matches!(outer_ref.table, Table::RecursiveCteInput(_)) {
                     // SQLite resolves the recursive self-reference as a plain

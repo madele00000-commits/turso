@@ -99,11 +99,18 @@ pub(crate) fn materialized_from_clause_subquery_storage(
 /// A read in a subquery or in a later compound arm is only known once the
 /// statement is planned, so [optimize_plan] calls this function.
 ///
+/// `stores_every_read` is [Dialect::stores_cte_read_more_than_once]: no read
+/// is merged and `NOT MATERIALIZED` is not looked at.
+///
 /// [optimize_plan]: crate::translate::optimizer::optimize_plan
-pub(crate) fn mark_shared_cte_materialization_requirements(plan: &mut Plan) {
+/// [Dialect::stores_cte_read_more_than_once]: crate::dialect::Dialect::stores_cte_read_more_than_once
+pub(crate) fn mark_shared_cte_materialization_requirements(
+    plan: &mut Plan,
+    stores_every_read: bool,
+) {
     let mut stored_reads = HashMap::default();
-    count_stored_cte_reads(&mut stored_reads, plan);
-    mark_stored_cte_reads(&stored_reads, plan);
+    count_stored_cte_reads(&mut stored_reads, plan, stores_every_read);
+    mark_stored_cte_reads(&stored_reads, plan, stores_every_read);
 }
 
 // Count, for each CTE not marked `NOT MATERIALIZED`, the reads of the statement
@@ -116,92 +123,118 @@ pub(crate) fn mark_shared_cte_materialization_requirements(plan: &mut Plan) {
 // only for the CTEs that the FROM clause of the statement stores, because those
 // are stored before the write and RETURNING reuses them. Correlated RETURNING
 // reads are not counted here.
-fn count_stored_cte_reads(stored_reads: &mut HashMap<usize, usize>, plan: &mut Plan) {
-    for_each_query_of_plan(plan, &mut |table_references,
-                                       non_from_clause_subqueries,
-                                       merged| {
-        let mut from_clause_cte_ids = HashSet::default();
-        for (table, merged) in table_references.joined_tables_mut().iter_mut().zip(merged) {
-            if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
-                let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-                if let Some(cte_id) = from_clause_subquery.cte_id() {
-                    if !merged && !from_clause_subquery.not_materialized_hint() {
-                        *stored_reads.entry(cte_id).or_default() += 1;
-                        from_clause_cte_ids.insert(cte_id);
+fn count_stored_cte_reads(
+    stored_reads: &mut HashMap<usize, usize>,
+    plan: &mut Plan,
+    stores_every_read: bool,
+) {
+    let not_materialized = |from_clause_subquery: &crate::schema::FromClauseSubquery| {
+        !stores_every_read && from_clause_subquery.not_materialized_hint()
+    };
+    for_each_query_of_plan(
+        plan,
+        stores_every_read,
+        &mut |table_references, non_from_clause_subqueries, merged| {
+            let mut from_clause_cte_ids = HashSet::default();
+            for (table, merged) in table_references.joined_tables_mut().iter_mut().zip(merged) {
+                if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+                    let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+                    if let Some(cte_id) = from_clause_subquery.cte_id() {
+                        if !merged && !not_materialized(from_clause_subquery) {
+                            *stored_reads.entry(cte_id).or_default() += 1;
+                            from_clause_cte_ids.insert(cte_id);
+                        }
                     }
+                    count_stored_cte_reads(
+                        stored_reads,
+                        from_clause_subquery.plan.as_mut(),
+                        stores_every_read,
+                    );
                 }
-                count_stored_cte_reads(stored_reads, from_clause_subquery.plan.as_mut());
             }
-        }
 
-        for subquery in non_from_clause_subqueries.iter_mut() {
-            let post_write_returning = subquery.origin.is_post_write_returning();
-            let SubqueryState::Unevaluated {
-                plan: Some(subquery_plan),
-            } = &mut subquery.state
-            else {
-                continue;
-            };
-            if !post_write_returning {
-                count_stored_cte_reads(stored_reads, subquery_plan);
-            } else if !plan_has_outer_scope_dependency(subquery_plan) {
-                let mut returning_reads = HashMap::default();
-                count_stored_cte_reads(&mut returning_reads, subquery_plan);
-                for (cte_id, count) in returning_reads {
-                    if from_clause_cte_ids.contains(&cte_id) {
-                        *stored_reads.entry(cte_id).or_default() += count;
+            for subquery in non_from_clause_subqueries.iter_mut() {
+                let post_write_returning = subquery.origin.is_post_write_returning();
+                let SubqueryState::Unevaluated {
+                    plan: Some(subquery_plan),
+                } = &mut subquery.state
+                else {
+                    continue;
+                };
+                if !post_write_returning {
+                    count_stored_cte_reads(stored_reads, subquery_plan, stores_every_read);
+                } else if !plan_has_outer_scope_dependency(subquery_plan) {
+                    let mut returning_reads = HashMap::default();
+                    count_stored_cte_reads(&mut returning_reads, subquery_plan, stores_every_read);
+                    for (cte_id, count) in returning_reads {
+                        if from_clause_cte_ids.contains(&cte_id) {
+                            *stored_reads.entry(cte_id).or_default() += count;
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
-fn mark_stored_cte_reads(stored_reads: &HashMap<usize, usize>, plan: &mut Plan) {
-    for_each_query_of_plan(plan, &mut |table_references,
-                                       non_from_clause_subqueries,
-                                       merged| {
-        let mut not_materialized_reads: HashMap<usize, usize> = HashMap::default();
-        for (table, merged) in table_references.joined_tables().iter().zip(merged) {
-            if let Table::FromClauseSubquery(from_clause_subquery) = &table.table {
-                if let Some(cte_id) = from_clause_subquery.cte_id() {
-                    if !merged && from_clause_subquery.not_materialized_hint() {
-                        *not_materialized_reads.entry(cte_id).or_default() += 1;
+fn mark_stored_cte_reads(
+    stored_reads: &HashMap<usize, usize>,
+    plan: &mut Plan,
+    stores_every_read: bool,
+) {
+    let not_materialized = |from_clause_subquery: &crate::schema::FromClauseSubquery| {
+        !stores_every_read && from_clause_subquery.not_materialized_hint()
+    };
+    for_each_query_of_plan(
+        plan,
+        stores_every_read,
+        &mut |table_references, non_from_clause_subqueries, merged| {
+            let mut not_materialized_reads: HashMap<usize, usize> = HashMap::default();
+            for (table, merged) in table_references.joined_tables().iter().zip(merged) {
+                if let Table::FromClauseSubquery(from_clause_subquery) = &table.table {
+                    if let Some(cte_id) = from_clause_subquery.cte_id() {
+                        if !merged && not_materialized(from_clause_subquery) {
+                            *not_materialized_reads.entry(cte_id).or_default() += 1;
+                        }
                     }
                 }
             }
-        }
-        for (table, merged) in table_references.joined_tables_mut().iter_mut().zip(merged) {
-            if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
-                let from_clause_subquery = Arc::make_mut(from_clause_subquery);
-                if let Some(cte_id) = from_clause_subquery.cte_id() {
-                    let reads = if from_clause_subquery.not_materialized_hint() {
-                        &not_materialized_reads
-                    } else {
-                        stored_reads
-                    };
-                    let shared = !merged
-                        && reads.get(&cte_id).copied().unwrap_or_default() > 1
-                        && !plan_has_outer_scope_dependency(&from_clause_subquery.plan);
-                    from_clause_subquery.set_shared_materialization(shared);
+            for (table, merged) in table_references.joined_tables_mut().iter_mut().zip(merged) {
+                if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
+                    let from_clause_subquery = Arc::make_mut(from_clause_subquery);
+                    if let Some(cte_id) = from_clause_subquery.cte_id() {
+                        let reads = if not_materialized(from_clause_subquery) {
+                            &not_materialized_reads
+                        } else {
+                            stored_reads
+                        };
+                        let shared = !merged
+                            && reads.get(&cte_id).copied().unwrap_or_default() > 1
+                            && !plan_has_outer_scope_dependency(&from_clause_subquery.plan);
+                        from_clause_subquery.set_shared_materialization(shared);
+                    }
+                    mark_stored_cte_reads(
+                        stored_reads,
+                        from_clause_subquery.plan.as_mut(),
+                        stores_every_read,
+                    );
                 }
-                mark_stored_cte_reads(stored_reads, from_clause_subquery.plan.as_mut());
             }
-        }
-        // The reads of RETURNING are marked when it is planned, by
-        // [mark_shared_cte_reads_of_subqueries].
-        for subquery in non_from_clause_subqueries.iter_mut() {
-            if subquery.origin.is_post_write_returning() {
-                continue;
+            // The reads of RETURNING are marked when it is planned, by
+            // [mark_shared_cte_reads_of_subqueries].
+            for subquery in non_from_clause_subqueries.iter_mut() {
+                if subquery.origin.is_post_write_returning() {
+                    continue;
+                }
+                if let SubqueryState::Unevaluated {
+                    plan: Some(subquery_plan),
+                } = &mut subquery.state
+                {
+                    mark_stored_cte_reads(stored_reads, subquery_plan, stores_every_read);
+                }
             }
-            if let SubqueryState::Unevaluated {
-                plan: Some(subquery_plan),
-            } = &mut subquery.state
-            {
-                mark_stored_cte_reads(stored_reads, subquery_plan);
-            }
-        }
-    });
+        },
+    );
 }
 
 /// Mark the CTE reads of `subqueries` that share one stored result, counting
@@ -222,6 +255,7 @@ fn mark_stored_cte_reads(stored_reads: &HashMap<usize, usize>, plan: &mut Plan) 
 pub(crate) fn mark_shared_cte_reads_of_subqueries<'a>(
     subqueries: impl IntoIterator<Item = &'a mut NonFromClauseSubquery>,
     stored_cte_ids: &[usize],
+    stores_every_read: bool,
 ) {
     let mut plans: Vec<(&mut Plan, usize)> = subqueries
         .into_iter()
@@ -244,13 +278,13 @@ pub(crate) fn mark_shared_cte_reads_of_subqueries<'a>(
         stored_cte_ids.iter().map(|&cte_id| (cte_id, 2)).collect();
     for (plan, resolutions) in plans.iter_mut() {
         let mut reads = HashMap::default();
-        count_stored_cte_reads(&mut reads, plan);
+        count_stored_cte_reads(&mut reads, plan, stores_every_read);
         for (cte_id, count) in reads {
             *stored_reads.entry(cte_id).or_default() += count * *resolutions;
         }
     }
     for (plan, _) in plans {
-        mark_stored_cte_reads(&stored_reads, plan);
+        mark_stored_cte_reads(&stored_reads, plan, stores_every_read);
     }
 }
 
@@ -258,28 +292,32 @@ pub(crate) fn mark_shared_cte_reads_of_subqueries<'a>(
 /// `plan` runs itself: each arm of a compound SELECT, both parts of a recursive
 /// CTE, and the queries of an UPDATE or DELETE. Nested queries are not visited.
 /// The third argument says, for each table, whether SQLite's query flattener
-/// merges it into the query (see [sqlite_flattens_from_clause_subquery]).
+/// merges it into the query (see [sqlite_flattens_from_clause_subquery]), and
+/// is always false when `stores_every_read` is set.
 fn for_each_query_of_plan(
     plan: &mut Plan,
+    stores_every_read: bool,
     visit: &mut impl FnMut(&mut TableReferences, &mut [NonFromClauseSubquery], &[bool]),
 ) {
     match plan {
-        Plan::Select(select_plan) => visit_select_plan(select_plan, false, visit),
+        Plan::Select(select_plan) => {
+            visit_select_plan(select_plan, false, stores_every_read, visit)
+        }
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
             for (select_plan, _) in left.iter_mut() {
-                visit_select_plan(select_plan, true, visit);
+                visit_select_plan(select_plan, true, stores_every_read, visit);
             }
-            visit_select_plan(right_most, true, visit);
+            visit_select_plan(right_most, true, stores_every_read, visit);
         }
         Plan::RecursiveCte(recursive_cte) => {
-            for_each_query_of_plan(&mut recursive_cte.initial_query, visit);
-            for_each_query_of_plan(&mut recursive_cte.recursive_query, visit);
+            for_each_query_of_plan(&mut recursive_cte.initial_query, stores_every_read, visit);
+            for_each_query_of_plan(&mut recursive_cte.recursive_query, stores_every_read, visit);
         }
         Plan::Delete(delete_plan) => {
             if let Some(rowset_plan) = &mut delete_plan.rowset_plan {
-                visit_select_plan(rowset_plan, false, visit);
+                visit_select_plan(rowset_plan, false, stores_every_read, visit);
             }
             // The table references of a DELETE hold only its target table.
             let merged = vec![false; delete_plan.table_references.joined_tables().len()];
@@ -297,8 +335,11 @@ fn for_each_query_of_plan(
                 has_where: !update_plan.where_clause.is_empty(),
                 ..Default::default()
             };
-            let merged =
-                tables_merged_by_sqlite(&reading_query, update_plan.from_tables.joined_tables());
+            let merged = tables_merged_by_sqlite(
+                &reading_query,
+                update_plan.from_tables.joined_tables(),
+                stores_every_read,
+            );
             visit(
                 &mut update_plan.from_tables,
                 &mut update_plan.non_from_clause_subqueries,
@@ -311,6 +352,7 @@ fn for_each_query_of_plan(
 fn visit_select_plan(
     select_plan: &mut SelectPlan,
     is_compound_arm: bool,
+    stores_every_read: bool,
     visit: &mut impl FnMut(&mut TableReferences, &mut [NonFromClauseSubquery], &[bool]),
 ) {
     let reading_query = ReadingQuery {
@@ -327,7 +369,11 @@ fn visit_select_plan(
             .iter()
             .any(|column| expr_calls_function_or_subquery(&column.expr)),
     };
-    let merged = tables_merged_by_sqlite(&reading_query, select_plan.joined_tables());
+    let merged = tables_merged_by_sqlite(
+        &reading_query,
+        select_plan.joined_tables(),
+        stores_every_read,
+    );
     visit(
         &mut select_plan.table_references,
         &mut select_plan.non_from_clause_subqueries,
@@ -354,9 +400,16 @@ struct ReadingQuery {
     has_complex_result: bool,
 }
 
-fn tables_merged_by_sqlite(reading_query: &ReadingQuery, tables: &[JoinedTable]) -> Vec<bool> {
+fn tables_merged_by_sqlite(
+    reading_query: &ReadingQuery,
+    tables: &[JoinedTable],
+    stores_every_read: bool,
+) -> Vec<bool> {
     (0..tables.len())
-        .map(|table_index| sqlite_flattens_from_clause_subquery(reading_query, tables, table_index))
+        .map(|table_index| {
+            !stores_every_read
+                && sqlite_flattens_from_clause_subquery(reading_query, tables, table_index)
+        })
         .collect()
 }
 
@@ -915,7 +968,11 @@ pub fn plan_subqueries_from_returning(
         &mut Vec::new(),
         &[],
     )?;
-    mark_shared_cte_reads_of_subqueries(non_from_clause_subqueries.iter_mut(), &[]);
+    mark_shared_cte_reads_of_subqueries(
+        non_from_clause_subqueries.iter_mut(),
+        &[],
+        resolver.catalog.dialect.stores_cte_read_more_than_once(),
+    );
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())
@@ -963,7 +1020,11 @@ pub fn plan_subqueries_from_upsert_do_update<'a>(
             &[],
         )?;
     }
-    mark_shared_cte_reads_of_subqueries(non_from_clause_subqueries.iter_mut(), stored_cte_ids);
+    mark_shared_cte_reads_of_subqueries(
+        non_from_clause_subqueries.iter_mut(),
+        stored_cte_ids,
+        resolver.catalog.dialect.stores_cte_read_more_than_once(),
+    );
 
     update_column_used_masks(table_references, non_from_clause_subqueries)?;
     Ok(())

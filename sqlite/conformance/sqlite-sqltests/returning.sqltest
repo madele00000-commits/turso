@@ -2746,3 +2746,22 @@ expect {
     1
     1
 }
+
+# SQLite runs a RETURNING subquery again for each written row only when its own
+# FROM clause names the written table. A subquery that reads the table in a
+# FROM-clause subquery or in a nested subquery runs once, for the first row.
+test returning-subquery-reading-written-table-in-nested-query-runs-once {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    UPDATE t SET a = a + 10 WHERE a > 1 RETURNING (SELECT count(*) FROM (SELECT a FROM t) WHERE a > 10);
+    UPDATE t SET a = a + 10 WHERE a > 10 RETURNING (SELECT (SELECT count(*) FROM t AS z WHERE z.a > 20));
+    UPDATE t SET a = a + 10 WHERE a > 20 RETURNING (SELECT count(*) FROM t WHERE a > 30);
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    2
+}

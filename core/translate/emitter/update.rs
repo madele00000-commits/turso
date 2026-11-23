@@ -2754,8 +2754,10 @@ fn emit_update_insns<'a>(
                         .iter_mut()
                         .filter(|s| !s.has_been_evaluated() && s.is_post_write_returning())
                     {
-                        let rerun_for_target_scan = subquery
-                            .reads_table(target_table.namespace, target_table.table.get_name());
+                        let rerun_for_target_scan = subquery.names_table_in_from_clause(
+                            target_table.namespace,
+                            target_table.table.get_name(),
+                        );
                         let subquery_plan = subquery.consume_plan(EvalAt::Loop(0));
                         emit_non_from_clause_subquery(
                             program,

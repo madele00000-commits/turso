@@ -622,7 +622,10 @@ pub fn optimize_plan(
 ) -> Result<()> {
     // Every statement is optimized here once its planning is complete, so this
     // is where all CTE reads of the statement are known.
-    mark_shared_cte_materialization_requirements(plan);
+    mark_shared_cte_materialization_requirements(
+        plan,
+        resolver.catalog.dialect.stores_cte_read_more_than_once(),
+    );
     let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,

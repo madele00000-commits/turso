@@ -478,7 +478,7 @@ WITH c(x) AS (SELECT random())
 SELECT x FROM c UNION SELECT x FROM c;   -- one row
 ```
 
-A subquery in the `RETURNING` clause of an `INSERT`, `UPDATE` or `DELETE` runs after the write. It reuses the CTE result only when a read before the write stored it, as described above, including a read in the `SELECT` of an `INSERT ... SELECT`. Otherwise it computes the CTE again and sees the written rows, as in SQLite. The `RETURNING` subqueries of a statement share one CTE result among themselves, even a single subquery that reads a column of the written row: it reads the same result for every row. The subqueries in the `DO UPDATE` of an upsert share one result among themselves too, and reuse a result that the `SELECT` of the `INSERT` stored, but do not share one with `RETURNING`.
+A subquery in the `RETURNING` clause of an `INSERT`, `UPDATE` or `DELETE` runs after the write. As in SQLite, it runs again for each written row only when it reads a column of the written row or its own `FROM` clause names the written table. Otherwise it runs once, after the first row is written. It reuses the CTE result only when a read before the write stored it, as described above, including a read in the `SELECT` of an `INSERT ... SELECT`. Otherwise it computes the CTE again and sees the rows written so far, as in SQLite. The `RETURNING` subqueries of a statement share one CTE result among themselves, even a single subquery that reads a column of the written row: it reads the same result for every row. The subqueries in the `DO UPDATE` of an upsert share one result among themselves too, and reuse a result that the `SELECT` of the `INSERT` stored, but do not share one with `RETURNING`.
 
 ### Multiple CTEs
 

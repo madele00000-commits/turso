@@ -628,24 +628,20 @@ impl Plan {
         ids
     }
 
-    /// Returns true if this plan or any of its subplans read from the given table.
-    /// (Not for Delete/Update plans)
-    fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
-        match self {
-            Plan::Select(select_plan) => select_plan.reads_table(namespace, table_name),
-            Plan::CompoundSelect {
-                left, right_most, ..
-            } => {
-                left.iter()
-                    .any(|(select_plan, _)| select_plan.reads_table(namespace, table_name))
-                    || right_most.reads_table(namespace, table_name)
-            }
-            Plan::RecursiveCte(plan) => {
-                plan.initial_query.reads_table(namespace, table_name)
-                    || plan.recursive_query.reads_table(namespace, table_name)
-            }
-            Plan::Delete(_) | Plan::Update(_) => false,
-        }
+    /// Whether the FROM clause of this SELECT, or of the last SELECT of a
+    /// compound, names the table. Subqueries and the bodies of FROM-clause
+    /// subqueries are not looked at.
+    fn names_table_in_from_clause(&self, namespace: NamespaceRef, table_name: &str) -> bool {
+        let select_plan = match self {
+            Plan::Select(select_plan) => select_plan,
+            Plan::CompoundSelect { right_most, .. } => right_most,
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => return false,
+        };
+        select_plan
+            .table_references
+            .joined_tables()
+            .iter()
+            .any(|table| table.matches(namespace, table_name))
     }
 }
 
@@ -1112,21 +1108,6 @@ impl SelectPlan {
                     Table::FromClauseSubquery(subquery) => plan_is_correlated(&subquery.plan),
                     _ => false,
                 })
-    }
-
-    fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
-        self.table_references.joined_tables().iter().any(|table| {
-            table.matches(namespace, table_name)
-                || match &table.table {
-                    Table::FromClauseSubquery(subquery) => {
-                        subquery.plan.reads_table(namespace, table_name)
-                    }
-                    Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => false,
-                }
-        }) || self
-            .non_from_clause_subqueries
-            .iter()
-            .any(|subquery| subquery.reads_table(namespace, table_name))
     }
 }
 
@@ -4691,10 +4672,15 @@ impl NonFromClauseSubquery {
             && matches!(self.eval_phase, SubqueryEvalPhase::PostWriteReturning)
     }
 
-    pub fn reads_table(&self, namespace: NamespaceRef, table_name: &str) -> bool {
+    /// Whether the FROM clause of the subquery's SELECT, or of the last SELECT
+    /// of a compound, names the table. SQLite runs a RETURNING subquery again
+    /// for each row when its FROM clause names the written table, and once
+    /// otherwise, also when it reads that table in a nested query or through a
+    /// CTE (`sqlite3ProcessReturningSubqueries` in trigger.c).
+    pub fn names_table_in_from_clause(&self, namespace: NamespaceRef, table_name: &str) -> bool {
         match &self.state {
             SubqueryState::Unevaluated { plan: Some(plan) } => {
-                Plan::reads_table(plan, namespace, table_name)
+                plan.names_table_in_from_clause(namespace, table_name)
             }
             _ => false,
         }

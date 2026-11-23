@@ -77,6 +77,17 @@ expect {
     1
 }
 
+# Each read of a CTE plans its body again, and a WITH clause inside the body
+# gets its own CTEs for each read. Here SQLite merges d into both reading
+# queries, so each read of d reads its own c.
+test cte-random-in-nested-with-is-computed-for-each-read-of-outer-cte {
+    WITH d AS (WITH c(x) AS (SELECT random()) SELECT x FROM c)
+    SELECT count(*) FROM d WHERE x IN (SELECT x FROM d);
+}
+expect {
+    0
+}
+
 test cte-random-same-value-in-compound-arms {
     WITH c(x) AS (SELECT random())
     SELECT x FROM c EXCEPT SELECT x FROM c;
@@ -219,6 +230,23 @@ test cte-returning-reuses-cte-materialized-before-delete {
 expect {
     2
     1
+}
+
+# A RETURNING subquery whose FROM clause does not name the written table runs
+# once, for the first written row, also when it reads that table through a CTE.
+test cte-returning-subquery-reads-cte-once-for-the-statement {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH c(x) AS (SELECT a FROM t)
+    UPDATE t SET a = a + 10 WHERE a > 1 RETURNING (SELECT count(*) FROM c WHERE x > 10);
+    WITH c(x) AS (SELECT a FROM t)
+    DELETE FROM t WHERE a > 10 RETURNING (SELECT count(*) FROM c);
+}
+expect {
+    1
+    1
+    2
+    2
 }
 
 # SQLite resolves the RETURNING list twice, which counts each of its reads of a
