@@ -1110,7 +1110,7 @@ pub fn translate_alter_table(
                 ));
             }
 
-            check_column_type(&col_def, table_name, btree.is_strict, resolver.schema())?;
+            check_column_type(&column, table_name, btree.is_strict, resolver.schema())?;
             let default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             if btree.is_strict {
                 column.resolve_custom_type(resolver.schema())?;
@@ -1562,14 +1562,14 @@ pub fn translate_alter_table(
                 match rename {
                     true => (false, false, None),
                     false => {
+                        let replacement_column =
+                            btree.column_for_alter(column_index, &definition, resolver.schema())?;
                         check_column_type(
-                            &definition,
+                            &replacement_column,
                             table_name,
                             btree.is_strict,
                             resolver.schema(),
                         )?;
-                        let replacement_column =
-                            btree.column_for_alter(column_index, &definition, resolver.schema())?;
                         let old_column = &btree.columns()[column_index];
                         // Switching between a rowid alias and a key with an automatic
                         // index would need that index created or dropped.
