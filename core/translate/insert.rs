@@ -3936,36 +3936,44 @@ fn emit_insert_select_into_temp_table(
     });
 
     let record_reg = program.alloc_register();
-    let affinity_str = if columns.is_empty() {
-        table
-            .columns()
-            .iter()
-            .filter(|col| !col.hidden() && !col.is_generated())
-            .map(|col| col.affinity().aff_mask())
-            .collect::<String>()
+    // A virtual table receives the SELECT values unchanged, as in SQLite, so
+    // the copy must not apply column affinity to them.
+    let affinity_str = if table.virtual_table().is_some() {
+        None
+    } else if columns.is_empty() {
+        Some(
+            table
+                .columns()
+                .iter()
+                .filter(|col| !col.hidden() && !col.is_generated())
+                .map(|col| col.affinity().aff_mask())
+                .collect::<String>(),
+        )
     } else {
-        columns
-            .iter()
-            .map(|col_name| {
-                let column_name = normalize_ident(col_name.as_str());
-                if ROWID_STRS
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&column_name))
-                {
-                    return Ok(Affinity::Integer.aff_mask());
-                }
-                table
-                    .get_column_by_name(&column_name)
-                    .map(|(_, col)| col.affinity().aff_mask())
-                    .ok_or_else(|| {
-                        crate::error::LimboError::ParseError(format!(
-                            "table {} has no column named {}",
-                            table.get_name(),
-                            column_name
-                        ))
-                    })
-            })
-            .collect::<Result<String>>()?
+        Some(
+            columns
+                .iter()
+                .map(|col_name| {
+                    let column_name = normalize_ident(col_name.as_str());
+                    if ROWID_STRS
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&column_name))
+                    {
+                        return Ok(Affinity::Integer.aff_mask());
+                    }
+                    table
+                        .get_column_by_name(&column_name)
+                        .map(|(_, col)| col.affinity().aff_mask())
+                        .ok_or_else(|| {
+                            crate::error::LimboError::ParseError(format!(
+                                "table {} has no column named {}",
+                                table.get_name(),
+                                column_name
+                            ))
+                        })
+                })
+                .collect::<Result<String>>()?,
+        )
     };
 
     program.emit_insn(Insn::MakeRecord {
@@ -3973,7 +3981,7 @@ fn emit_insert_select_into_temp_table(
         count: to_u32(num_result_cols),
         dest_reg: to_u32(record_reg),
         index_name: None,
-        affinity_str: Some(affinity_str),
+        affinity_str,
     });
 
     let rowid_reg = program.alloc_register();
