@@ -303,3 +303,95 @@ test aggregate-in-where-of-correlated-having-subquery-per-group {
 expect error {
     misuse of aggregate function count()
 }
+
+@setup tables
+test max-bare-column-in-having-without-group-by {
+    SELECT max(a) FROM t HAVING b = 60;
+}
+expect {
+    6
+}
+
+@setup tables
+test max-bare-column-in-having-without-group-by-of-first-row {
+    SELECT max(a) FROM t HAVING b = 10;
+}
+expect {
+}
+
+@setup tables
+test max-bare-column-in-subquery-in-having-without-group-by {
+    SELECT max(a) FROM t HAVING (SELECT t.b) = 60;
+}
+expect {
+    6
+}
+
+@setup tables
+test max-bare-column-in-subquery-with-outer-aggregate {
+    SELECT count(*) + (SELECT t.b + max(t.a)) FROM t;
+}
+expect {
+    75
+}
+
+# The value does not depend on the order in which an index returns the rows.
+setup indexed {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (3, 30), (1, 10), (5, 50), (2, 20), (4, 40);
+    CREATE INDEX ta ON t(a);
+}
+
+@setup indexed
+test max-bare-column-index-range {
+    SELECT max(a) + b FROM t WHERE a < 3;
+}
+expect {
+    22
+}
+
+@setup indexed
+test max-bare-column-in-having-index-range {
+    SELECT max(a) FROM t WHERE a < 3 HAVING b = 20;
+}
+expect {
+    2
+}
+
+@setup indexed
+test min-bare-column-index-range {
+    SELECT min(a), b FROM t WHERE a > 2;
+}
+expect {
+    3|30
+}
+
+# Rows whose argument is NULL count until the first non-NULL value, and an
+# equal value does not replace the one found first.
+setup nulls-and-ties {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (NULL, 1), (NULL, 2), (7, 3), (NULL, 4), (7, 5);
+}
+
+@setup nulls-and-ties
+test max-bare-column-skips-null-and-equal-values {
+    SELECT max(a), b FROM t;
+}
+expect {
+    7|3
+}
+
+@setup nulls-and-ties
+test max-of-only-nulls-reads-last-row {
+    SELECT max(a), b FROM t WHERE b IN (1, 2, 4);
+}
+expect {
+    |4
+}
+
+test max-bare-column-equal-under-collation {
+    SELECT max(x COLLATE NOCASE), y FROM (SELECT 'a' AS x, 1 AS y UNION ALL SELECT 'A', 2 UNION ALL SELECT 'b', 3 UNION ALL SELECT 'B', 4);
+}
+expect {
+    b|3
+}

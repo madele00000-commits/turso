@@ -16,8 +16,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{compound_order_by_collation, CollationSeq, TextCollation};
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
-    bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement, expr_vector_size,
-    walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+    bind_and_rewrite_expr, expr_contains_function_that_changes_within_statement,
+    expr_reads_a_column, expr_vector_size, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
 use crate::translate::group_by::compute_group_by_sort_order;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -33,9 +33,12 @@ use crate::translate::result_row::emit_select_result;
 use crate::translate::row_security;
 use crate::translate::subquery::{
     plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
+    result_column_subqueries_move_an_aggregate,
 };
 use crate::translate::window::plan_windows;
-use crate::util::{exprs_are_equivalent, exprs_are_equivalent_as_written, normalize_ident};
+use crate::util::{
+    exprs_are_equivalent, exprs_are_equivalent_as_written, normalize_ident, walk_select_expressions,
+};
 use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
@@ -641,293 +644,328 @@ fn prepare_one_select_plan(
             if plan.result_columns.len() > crate::types::MAX_COLUMN {
                 crate::bail_parse_error!("too many columns in result set");
             }
-
-            // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
+            // HAVING without GROUP BY needs an aggregate query. SQLite checks this
+            // right after it resolves the result columns, before WHERE, HAVING and
+            // ORDER BY. An aggregate that a result-column subquery moves up to this
+            // query is only found when the subqueries are planned, so unless a
+            // result-column subquery has an aggregate that can move up, the check
+            // runs here; otherwise it runs after subquery planning, and an error in
+            // WHERE, HAVING or ORDER BY first plans the result-column subqueries to
+            // learn which error SQLite raises.
+            let having_without_group_by = group_by
+                .as_ref()
+                .is_some_and(|gb| gb.exprs.is_empty() && gb.having.is_some());
+            let result_columns_compute_an_aggregate = aggregate_expressions.iter().any(|agg| {
+                !aggregate_moves_to_enclosing_query(agg, &plan.table_references, resolver)
+            });
+            let only_subqueries_can_make_query_aggregate = having_without_group_by
+                && !result_columns_compute_an_aggregate
+                && !connection.dialect().having_makes_query_aggregate();
+            if only_subqueries_can_make_query_aggregate
+                && !result_column_subquery_may_move_aggregate_up(&plan.result_columns, resolver)?
             {
-                parse_where(
-                    where_clause,
-                    &mut plan.table_references,
-                    Some(&plan.result_columns),
-                    &mut plan.where_clause,
-                    resolver,
+                // SQLite resolves the result columns before it checks HAVING, so
+                // an error in a result-column subquery is reported first.
+                result_column_subqueries_move_an_aggregate(
+                    program, &mut plan, resolver, connection,
                 )?;
+                crate::bail_parse_error!("HAVING clause on a non-aggregate query");
             }
 
-            // This step can only be performed at this point, because all table references are now available.
-            // Virtual table predicates may depend on column bindings from tables to the right in the join order,
-            // so we must wait until the full set of references has been collected.
-            {
-                // SQLite adds table-function arguments after ON and WHERE terms.
-                // Some virtual tables select the last constraint for a hidden column.
-                add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
-            }
+            let where_having_order_by = (|| -> Result<()> {
+                // Parse the actual WHERE clause and add its conditions to the plan WHERE clause that already contains the join conditions.
+                {
+                    parse_where(
+                        where_clause,
+                        &mut plan.table_references,
+                        Some(&plan.result_columns),
+                        &mut plan.where_clause,
+                        resolver,
+                    )?;
+                }
 
-            {
-                trace_stack!("process_group_by");
-                if let Some(mut group_by) = group_by {
-                    // Process HAVING clause if present
-                    let having_predicates = if let Some(having) = group_by.having {
-                        Some(process_having_clause(
-                            *having,
-                            &mut plan.table_references,
-                            &plan.result_columns,
-                            resolver,
-                            &mut aggregate_expressions,
-                        )?)
-                    } else {
-                        None
-                    };
+                // This step can only be performed at this point, because all table references are now available.
+                // Virtual table predicates may depend on column bindings from tables to the right in the join order,
+                // so we must wait until the full set of references has been collected.
+                {
+                    // SQLite adds table-function arguments after ON and WHERE terms.
+                    // Some virtual tables select the last constraint for a hidden column.
+                    add_vtab_predicates_to_where_clause(&mut vtab_predicates, &mut plan, resolver)?;
+                }
 
-                    if !group_by.exprs.is_empty() {
-                        // Normal GROUP BY with expressions
-                        for expr in group_by.exprs.iter_mut() {
-                            replace_column_number_with_copy_of_column_expr(
-                                expr,
+                {
+                    trace_stack!("process_group_by");
+                    if let Some(mut group_by) = group_by {
+                        // Process HAVING clause if present
+                        let having_predicates = if let Some(having) = group_by.having {
+                            Some(process_having_clause(
+                                *having,
+                                &mut plan.table_references,
                                 &plan.result_columns,
-                                "GROUP BY",
-                            )?;
-                            bind_and_rewrite_expr(
-                                expr,
-                                Some(&mut plan.table_references),
-                                Some(&plan.result_columns),
                                 resolver,
-                                BindingBehavior::TryCanonicalColumnsFirst,
-                            )?;
-                        }
-
-                        let exprs: Vec<ast::Expr> =
-                            group_by.exprs.into_iter().map(|expr| *expr).collect();
-                        let having = match having_predicates {
-                            Some(having) => Some(move_group_by_only_having_terms_to_where(
-                                having,
-                                &exprs,
-                                &aggregate_expressions,
-                                &plan.table_references,
-                                resolver,
-                                &mut plan.where_clause,
+                                &mut aggregate_expressions,
                             )?)
-                            .filter(|having| !having.is_empty()),
-                            None => None,
+                        } else {
+                            None
                         };
-                        plan.group_by = Some(GroupBy {
-                            sort_order: Vec::new(),
-                            nulls_order: Vec::new(),
-                            exprs,
-                            sort_elided: false,
-                            having,
-                            columns_read_by_group_subqueries: Vec::new(),
-                        });
-                    } else {
-                        // HAVING without GROUP BY: treat as ungrouped aggregation with filter
-                        plan.group_by = Some(GroupBy {
-                            sort_order: Vec::new(),
-                            nulls_order: Vec::new(),
-                            sort_elided: false,
-                            exprs: vec![],
-                            having: having_predicates,
-                            columns_read_by_group_subqueries: Vec::new(),
-                        });
+
+                        if !group_by.exprs.is_empty() {
+                            // Normal GROUP BY with expressions
+                            for expr in group_by.exprs.iter_mut() {
+                                replace_column_number_with_copy_of_column_expr(
+                                    expr,
+                                    &plan.result_columns,
+                                    "GROUP BY",
+                                )?;
+                                bind_and_rewrite_expr(
+                                    expr,
+                                    Some(&mut plan.table_references),
+                                    Some(&plan.result_columns),
+                                    resolver,
+                                    BindingBehavior::TryCanonicalColumnsFirst,
+                                )?;
+                            }
+
+                            let exprs: Vec<ast::Expr> =
+                                group_by.exprs.into_iter().map(|expr| *expr).collect();
+                            let having = match having_predicates {
+                                Some(having) => Some(move_group_by_only_having_terms_to_where(
+                                    having,
+                                    &exprs,
+                                    &aggregate_expressions,
+                                    &plan.table_references,
+                                    resolver,
+                                    &mut plan.where_clause,
+                                )?)
+                                .filter(|having| !having.is_empty()),
+                                None => None,
+                            };
+                            plan.group_by = Some(GroupBy {
+                                sort_order: Vec::new(),
+                                nulls_order: Vec::new(),
+                                exprs,
+                                sort_elided: false,
+                                having,
+                                columns_read_by_group_subqueries: Vec::new(),
+                            });
+                        } else {
+                            // HAVING without GROUP BY: treat as ungrouped aggregation with filter
+                            plan.group_by = Some(GroupBy {
+                                sort_order: Vec::new(),
+                                nulls_order: Vec::new(),
+                                sort_elided: false,
+                                exprs: vec![],
+                                having: having_predicates,
+                                columns_read_by_group_subqueries: Vec::new(),
+                            });
+                        }
                     }
                 }
-            }
 
-            plan.aggregates = aggregate_expressions;
+                plan.aggregates = aggregate_expressions;
 
-            // An aggregate whose argument columns belong to the enclosing query
-            // is computed by that query, not by this subquery (SQLite binds an
-            // aggregate to the nearest query that supplies a referenced column).
-            // Move those up so this subquery never computes them; the enclosing
-            // query collects them once its subqueries are planned. When there is
-            // no enclosing query the move fails and the aggregate stays here.
-            let tables = &plan.table_references;
-            plan.aggregates.retain(|agg| {
-                !(aggregate_belongs_to_enclosing_query(agg, tables)
-                    && resolver.move_aggregate_to_enclosing_query(agg.clone()))
-            });
+                // An aggregate whose argument columns belong to the enclosing query
+                // is computed by that query, not by this subquery (SQLite binds an
+                // aggregate to the nearest query that supplies a referenced column).
+                // Move those up so this subquery never computes them; the enclosing
+                // query collects them once its subqueries are planned. When there is
+                // no enclosing query the move fails and the aggregate stays here.
+                let tables = &plan.table_references;
+                plan.aggregates.retain(|agg| {
+                    !(aggregate_belongs_to_enclosing_query(agg, tables)
+                        && resolver.move_aggregate_to_enclosing_query(agg.clone()))
+                });
 
-            // HAVING without GROUP BY requires aggregates in the SELECT
-            if let Some(ref group_by) = plan.group_by {
-                if group_by.exprs.is_empty()
-                    && group_by.having.is_some()
-                    && plan.aggregates.is_empty()
+                // Parse the ORDER BY clause
+                let mut key = Vec::new();
+                let agg_count_before_order_by = plan.aggregates.len();
+                let has_group_by = plan
+                    .group_by
+                    .as_ref()
+                    .is_some_and(|gb| !gb.exprs.is_empty());
+
+                for mut o in order_by {
+                    replace_column_number_with_copy_of_column_expr(
+                        &mut o.expr,
+                        &plan.result_columns,
+                        "ORDER BY",
+                    )?;
+
+                    check_sort_name_is_one_output_column(&o.expr, "ORDER BY", &plan, resolver)?;
+                    let binding = sort_expr_binding(&o.expr, resolver);
+                    bind_and_rewrite_expr(
+                        &mut o.expr,
+                        Some(&mut plan.table_references),
+                        Some(&plan.result_columns),
+                        resolver,
+                        binding,
+                    )?;
+                    key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
+                }
+                if matches!(distinctness, Some(ast::SelectDistinctness::Distinct)) {
+                    check_order_by_of_distinct_is_in_select_list(&key, &plan, resolver)?;
+                }
+                // Remove duplicate ORDER BY expressions, keeping the first occurrence.
+                // Duplicates are semantically redundant.
+                let mut i = 0;
+                while i < key.len() {
+                    if key[..i]
+                        .iter()
+                        .any(|(prev, _, _)| exprs_are_equivalent(prev, &key[i].0))
+                    {
+                        key.remove(i);
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                let distinct_on_expr_count = match distinctness {
+                    Some(ast::SelectDistinctness::DistinctOn(distinct_on)) => {
+                        sort_by_distinct_on_exprs(distinct_on, &mut key, &mut plan, resolver)?
+                    }
+                    _ => 0,
+                };
+
+                // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
+                // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
+                // This means we truncate the ORDER BY to just the rowid column.
+                // We do this for SQLite compatibility - SQLite truncates before validating, so
+                // even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
+                let mut terms_cut_after_rowid = Vec::new();
+                if key.len() > 1 && plan.table_references.joined_tables().len() == 1 {
+                    let joined = &plan.table_references.joined_tables()[0];
+                    let table_id = joined.internal_id;
+                    let rowid_alias_col = joined
+                        .btree()
+                        .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
+
+                    let first_is_rowid = match key[0].0.as_ref() {
+                        ast::Expr::Column { table, column, .. } => {
+                            *table == table_id && rowid_alias_col == Some(*column)
+                        }
+                        ast::Expr::RowId { table, .. } => *table == table_id,
+                        _ => false,
+                    };
+                    if first_is_rowid {
+                        terms_cut_after_rowid = key.split_off(1);
+                    }
+                }
+
+                {
+                    trace_stack!("process_order_by");
+                    let is_aggregate_query = has_group_by
+                        || agg_count_before_order_by > 0
+                        || result_columns_contain_aggregate(&plan.result_columns, resolver)?;
+                    if !is_aggregate_query {
+                        for (expr, _, _) in key.iter().take(distinct_on_expr_count) {
+                            if first_aggregate_without_over_clause(expr, resolver)?.is_some() {
+                                crate::bail_parse_error!(
+                                    "an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported"
+                                );
+                            }
+                        }
+                    }
+                    for (expr, _, _) in key.iter() {
+                        let had_agg = resolve_window_and_aggregate_functions(
+                            expr,
+                            resolver,
+                            &mut plan.aggregates,
+                            Some(&mut windows),
+                            &mut named_windows,
+                        )?;
+
+                        // SQLite rejects aggregate functions in ORDER BY when the query
+                        // has a FROM clause and is not already an aggregate query (no
+                        // GROUP BY and no aggregates in SELECT/HAVING).
+                        // e.g. SELECT f1 FROM t ORDER BY min(f1);
+                        // But SELECT 1 ORDER BY sum(1) is allowed (no FROM clause).
+                        let has_from = !plan.table_references.joined_tables().is_empty();
+                        if had_agg && has_from && !is_aggregate_query {
+                            let agg = &plan.aggregates[agg_count_before_order_by];
+                            crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
+                        }
+                    }
+                    let mut cut_aggregates = plan.aggregates.clone();
+                    let mut cut_windows = windows.clone();
+                    let mut cut_named_windows = named_windows.clone();
+                    for (expr, _, _) in terms_cut_after_rowid.iter() {
+                        resolve_window_and_aggregate_functions(
+                            expr,
+                            resolver,
+                            &mut cut_aggregates,
+                            Some(&mut cut_windows),
+                            &mut cut_named_windows,
+                        )?;
+                    }
+                    if !cut_windows.is_empty() && !is_aggregate_query {
+                        for (expr, _, _) in key.iter().chain(terms_cut_after_rowid.iter()) {
+                            if let Some(name) = first_aggregate_without_over_clause(expr, resolver)?
+                            {
+                                crate::bail_parse_error!("misuse of aggregate: {}()", name);
+                            }
+                        }
+                    }
+                }
+                plan.order_by = key;
+
+                // Single-row aggregate queries (aggregates without GROUP BY and without window functions)
+                // produce exactly one row, so ORDER BY is meaningless. Clearing it here also avoids
+                // eagerly validating subqueries in ORDER BY that SQLite would skip due to optimization.
+                // Note: HAVING without GROUP BY sets group_by to Some with empty exprs, still single-row.
+                let is_single_row_aggregate = !plan.aggregates.is_empty()
+                    && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
+                    && windows.is_empty();
+                if is_single_row_aggregate {
+                    let keys_are_aggregate_calls = plan
+                        .order_by
+                        .iter()
+                        .take(distinct_on_expr_count)
+                        .all(|(expr, _, _)| aggregate_call_name(expr, resolver).is_some());
+                    if !keys_are_aggregate_calls {
+                        crate::bail_parse_error!(
+                            "a SELECT DISTINCT ON expression that computes on an aggregate in a query without GROUP BY is not supported"
+                        );
+                    }
+                    plan.order_by.clear();
+                }
+                let distinct_on_key_count = distinct_on_expr_count.min(plan.order_by.len());
+                if distinct_on_key_count > 0 {
+                    check_distinct_on_can_run_after_the_sort(
+                        &plan,
+                        distinct_on_key_count,
+                        resolver,
+                    )?;
+                    plan.distinctness = Distinctness::DistinctOn {
+                        key_count: distinct_on_key_count,
+                    };
+                }
+
+                if let Some(group_by) = &mut plan.group_by {
+                    // now that we have resolved the ORDER BY expressions and aggregates, we can
+                    // compute the necessary sort order for the GROUP BY clause
+                    (group_by.sort_order, group_by.nulls_order) = compute_group_by_sort_order(
+                        &group_by.exprs,
+                        &plan.order_by,
+                        &plan.aggregates,
+                        resolver,
+                    );
+                    debug_assert_eq!(
+                        group_by.exprs.len(),
+                        group_by.sort_order.len(),
+                        "GROUP BY exprs and sort_order must have the same length"
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(err) = where_having_order_by {
+                if only_subqueries_can_make_query_aggregate
+                    && !result_column_subqueries_move_an_aggregate(
+                        program, &mut plan, resolver, connection,
+                    )?
                 {
                     crate::bail_parse_error!("HAVING clause on a non-aggregate query");
                 }
-            }
-
-            // Parse the ORDER BY clause
-            let mut key = Vec::new();
-            let agg_count_before_order_by = plan.aggregates.len();
-            let has_group_by = plan
-                .group_by
-                .as_ref()
-                .is_some_and(|gb| !gb.exprs.is_empty());
-
-            for mut o in order_by {
-                replace_column_number_with_copy_of_column_expr(
-                    &mut o.expr,
-                    &plan.result_columns,
-                    "ORDER BY",
-                )?;
-
-                check_sort_name_is_one_output_column(&o.expr, "ORDER BY", &plan, resolver)?;
-                let binding = sort_expr_binding(&o.expr, resolver);
-                bind_and_rewrite_expr(
-                    &mut o.expr,
-                    Some(&mut plan.table_references),
-                    Some(&plan.result_columns),
-                    resolver,
-                    binding,
-                )?;
-                key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc), o.nulls));
-            }
-            if matches!(distinctness, Some(ast::SelectDistinctness::Distinct)) {
-                check_order_by_of_distinct_is_in_select_list(&key, &plan, resolver)?;
-            }
-            // Remove duplicate ORDER BY expressions, keeping the first occurrence.
-            // Duplicates are semantically redundant.
-            let mut i = 0;
-            while i < key.len() {
-                if key[..i]
-                    .iter()
-                    .any(|(prev, _, _)| exprs_are_equivalent(prev, &key[i].0))
-                {
-                    key.remove(i);
-                } else {
-                    i += 1;
-                }
-            }
-
-            let distinct_on_expr_count = match distinctness {
-                Some(ast::SelectDistinctness::DistinctOn(distinct_on)) => {
-                    sort_by_distinct_on_exprs(distinct_on, &mut key, &mut plan, resolver)?
-                }
-                _ => 0,
-            };
-
-            // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
-            // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
-            // This means we truncate the ORDER BY to just the rowid column.
-            // We do this for SQLite compatibility - SQLite truncates before validating, so
-            // even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
-            let mut terms_cut_after_rowid = Vec::new();
-            if key.len() > 1 && plan.table_references.joined_tables().len() == 1 {
-                let joined = &plan.table_references.joined_tables()[0];
-                let table_id = joined.internal_id;
-                let rowid_alias_col = joined
-                    .btree()
-                    .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
-
-                let first_is_rowid = match key[0].0.as_ref() {
-                    ast::Expr::Column { table, column, .. } => {
-                        *table == table_id && rowid_alias_col == Some(*column)
-                    }
-                    ast::Expr::RowId { table, .. } => *table == table_id,
-                    _ => false,
-                };
-                if first_is_rowid {
-                    terms_cut_after_rowid = key.split_off(1);
-                }
-            }
-
-            {
-                trace_stack!("process_order_by");
-                let is_aggregate_query = has_group_by
-                    || agg_count_before_order_by > 0
-                    || result_columns_contain_aggregate(&plan.result_columns, resolver)?;
-                if !is_aggregate_query {
-                    for (expr, _, _) in key.iter().take(distinct_on_expr_count) {
-                        if first_aggregate_without_over_clause(expr, resolver)?.is_some() {
-                            crate::bail_parse_error!(
-                                "an aggregate in a SELECT DISTINCT ON expression of a query with no other aggregate is not supported"
-                            );
-                        }
-                    }
-                }
-                for (expr, _, _) in key.iter() {
-                    let had_agg = resolve_window_and_aggregate_functions(
-                        expr,
-                        resolver,
-                        &mut plan.aggregates,
-                        Some(&mut windows),
-                        &mut named_windows,
-                    )?;
-
-                    // SQLite rejects aggregate functions in ORDER BY when the query
-                    // has a FROM clause and is not already an aggregate query (no
-                    // GROUP BY and no aggregates in SELECT/HAVING).
-                    // e.g. SELECT f1 FROM t ORDER BY min(f1);
-                    // But SELECT 1 ORDER BY sum(1) is allowed (no FROM clause).
-                    let has_from = !plan.table_references.joined_tables().is_empty();
-                    if had_agg && has_from && !is_aggregate_query {
-                        let agg = &plan.aggregates[agg_count_before_order_by];
-                        crate::bail_parse_error!("misuse of aggregate: {}()", agg.func);
-                    }
-                }
-                let mut cut_aggregates = plan.aggregates.clone();
-                let mut cut_windows = windows.clone();
-                let mut cut_named_windows = named_windows.clone();
-                for (expr, _, _) in terms_cut_after_rowid.iter() {
-                    resolve_window_and_aggregate_functions(
-                        expr,
-                        resolver,
-                        &mut cut_aggregates,
-                        Some(&mut cut_windows),
-                        &mut cut_named_windows,
-                    )?;
-                }
-                if !cut_windows.is_empty() && !is_aggregate_query {
-                    for (expr, _, _) in key.iter().chain(terms_cut_after_rowid.iter()) {
-                        if let Some(name) = first_aggregate_without_over_clause(expr, resolver)? {
-                            crate::bail_parse_error!("misuse of aggregate: {}()", name);
-                        }
-                    }
-                }
-            }
-            plan.order_by = key;
-
-            // Single-row aggregate queries (aggregates without GROUP BY and without window functions)
-            // produce exactly one row, so ORDER BY is meaningless. Clearing it here also avoids
-            // eagerly validating subqueries in ORDER BY that SQLite would skip due to optimization.
-            // Note: HAVING without GROUP BY sets group_by to Some with empty exprs, still single-row.
-            let is_single_row_aggregate = !plan.aggregates.is_empty()
-                && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
-                && windows.is_empty();
-            if is_single_row_aggregate {
-                let keys_are_aggregate_calls = plan
-                    .order_by
-                    .iter()
-                    .take(distinct_on_expr_count)
-                    .all(|(expr, _, _)| aggregate_call_name(expr, resolver).is_some());
-                if !keys_are_aggregate_calls {
-                    crate::bail_parse_error!(
-                        "a SELECT DISTINCT ON expression that computes on an aggregate in a query without GROUP BY is not supported"
-                    );
-                }
-                plan.order_by.clear();
-            }
-            let distinct_on_key_count = distinct_on_expr_count.min(plan.order_by.len());
-            if distinct_on_key_count > 0 {
-                check_distinct_on_can_run_after_the_sort(&plan, distinct_on_key_count, resolver)?;
-                plan.distinctness = Distinctness::DistinctOn {
-                    key_count: distinct_on_key_count,
-                };
-            }
-
-            if let Some(group_by) = &mut plan.group_by {
-                // now that we have resolved the ORDER BY expressions and aggregates, we can
-                // compute the necessary sort order for the GROUP BY clause
-                (group_by.sort_order, group_by.nulls_order) = compute_group_by_sort_order(
-                    &group_by.exprs,
-                    &plan.order_by,
-                    &plan.aggregates,
-                    resolver,
-                );
-                debug_assert_eq!(
-                    group_by.exprs.len(),
-                    group_by.sort_order.len(),
-                    "GROUP BY exprs and sort_order must have the same length"
-                );
+                return Err(err);
             }
 
             // Parse the LIMIT/OFFSET clause
@@ -935,6 +973,10 @@ fn prepare_one_select_plan(
                 (plan.limit, plan.offset) =
                     limit.map_or(Ok((None, None)), |l| parse_limit(l, resolver))?;
             }
+
+            // plan_windows moves the aggregates into the plan it builds, so
+            // whether the query has aggregates is read before it runs.
+            let has_aggregates_before_windows = !plan.aggregates.is_empty();
 
             if !windows.is_empty() {
                 plan_windows(program, &mut plan, resolver, connection, &mut windows)?;
@@ -945,9 +987,31 @@ fn prepare_one_select_plan(
             // and ends after; the collected aggregates become this query's,
             // making it an aggregate query.
             resolver.begin_collecting_aggregates_from_subqueries();
-            plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
+            let result_column_subqueries_moved_an_aggregate =
+                plan_subqueries_from_select_plan(program, &mut plan, resolver, connection)?;
             let aggregates_from_subqueries = resolver.take_aggregates_from_subqueries();
             plan.aggregates.extend(aggregates_from_subqueries);
+
+            // HAVING without GROUP BY needs an aggregate query. This is checked
+            // after the subqueries are planned because an aggregate that a
+            // result-column subquery moves up to this query counts too.
+            if only_subqueries_can_make_query_aggregate
+                && !result_column_subqueries_moved_an_aggregate
+            {
+                crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+            }
+            // In a dialect where HAVING alone makes the query an aggregate
+            // query, the emitter still runs a query without aggregates one row
+            // at a time and would skip HAVING.
+            if having_without_group_by
+                && connection.dialect().having_makes_query_aggregate()
+                && !has_aggregates_before_windows
+                && plan.aggregates.is_empty()
+            {
+                crate::bail_parse_error!(
+                    "HAVING without GROUP BY in a query without aggregates is not supported"
+                );
+            }
 
             {
                 trace_stack!("validate_plan");
@@ -1094,6 +1158,36 @@ pub(crate) fn first_aggregate_without_over_clause<'a>(
         }
         Ok(WalkControl::Continue)
     })?;
+    Ok(found)
+}
+
+/// Whether a subquery in the result columns has an aggregate call that reads a
+/// column. Such an aggregate may belong to this query when the column is this
+/// query's; an aggregate that reads no column always belongs to its own query.
+fn result_column_subquery_may_move_aggregate_up(
+    result_columns: &[ResultSetColumn],
+    resolver: &Resolver,
+) -> Result<bool> {
+    let mut found = false;
+    for rc in result_columns {
+        walk_expr(&rc.expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            let select = match e {
+                ast::Expr::Subquery(select) | ast::Expr::Exists(select) => select,
+                ast::Expr::InSelect { rhs, .. } => rhs,
+                _ => return Ok(WalkControl::Continue),
+            };
+            walk_select_expressions(select, &mut |inner: &ast::Expr| -> Result<WalkControl> {
+                if !found
+                    && aggregate_call_name(inner, resolver).is_some()
+                    && expr_reads_a_column(inner)
+                {
+                    found = true;
+                }
+                Ok(WalkControl::Continue)
+            })?;
+            Ok(WalkControl::Continue)
+        })?;
+    }
     Ok(found)
 }
 
@@ -2019,6 +2113,17 @@ pub fn emit_simple_count(
         t_ctx.limit_ctx,
     )?;
     Ok(true)
+}
+
+/// Whether `agg` moves up to the enclosing query: its argument columns belong
+/// to that query and that query is collecting the aggregates of its subqueries.
+fn aggregate_moves_to_enclosing_query(
+    agg: &super::plan::Aggregate,
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> bool {
+    aggregate_belongs_to_enclosing_query(agg, tables)
+        && resolver.is_collecting_aggregates_from_subqueries()
 }
 
 /// True when this aggregate belongs to the immediate enclosing query rather
