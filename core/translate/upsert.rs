@@ -398,23 +398,26 @@ fn upsert_matches_index(
         .map(|ic| ic.expression().map(bind_index_expr).transpose())
         .collect::<crate::Result<Vec<_>>>()?;
     let column_set = resolver.catalog.dialect.upsert_target_matches_column_set();
-    let matches = |term: &ast::Expr, i: usize| {
-        target_term_matches_index_column(
-            term,
-            &index.columns[i],
-            index_exprs[i].as_ref(),
-            column_set,
-        )
-    };
-    let columns = 0..index.columns.len();
-    let every_column_matches = columns
-        .clone()
-        .all(|i| terms.iter().any(|term| matches(term, i)));
+    // matches[t][i]: whether term t matches index column i.
+    let matches = terms
+        .iter()
+        .map(|term| {
+            (0..index.columns.len())
+                .map(|i| {
+                    target_term_matches_index_column(
+                        term,
+                        &index.columns[i],
+                        index_exprs[i].as_ref(),
+                        column_set,
+                    )
+                })
+                .collect::<crate::Result<Vec<_>>>()
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    let every_column_matches = (0..index.columns.len()).all(|i| matches.iter().any(|term| term[i]));
     Ok(every_column_matches
         && if column_set {
-            terms
-                .iter()
-                .all(|term| columns.clone().any(|i| matches(term, i)))
+            matches.iter().all(|term| term.iter().any(|&m| m))
         } else {
             terms.len() == index.columns.len()
         })
@@ -429,45 +432,45 @@ fn target_term_matches_index_column(
     index_column: &IndexColumn,
     index_expr: Option<&ast::Expr>,
     rowid_alias_is_column: bool,
-) -> bool {
-    // As in SQLite, only the outermost COLLATE of the term counts, and a term
-    // without one matches a column of any collation.
-    let (term, collation) = skip_parens_and_collate(term);
-    if collation.is_some_and(|name| {
-        !name
-            .as_str()
-            .eq_ignore_ascii_case(&index_column.collation.to_string())
-    }) {
-        return false;
-    }
-    match index_expr {
-        // The collation of the index column was compared above, so a COLLATE
-        // at the top of the index expression is not part of the comparison.
-        Some(index_expr) => {
-            exprs_are_equivalent_as_written(term, skip_parens_and_collate(index_expr).0)
+) -> crate::Result<bool> {
+    // SQLite compares the term with the index column wrapped in one COLLATE
+    // operator of the column's collation (sqlite3ExprCompare). So a COLLATE at
+    // the top of the term must name that collation, and below it the term must
+    // be the column as written. A term without COLLATE matches a column of any
+    // collation.
+    let (term, term_has_collate) = match unwrap_parens(term)? {
+        ast::Expr::Collate(inner, name) => {
+            if !name
+                .as_str()
+                .eq_ignore_ascii_case(&index_column.collation.to_string())
+            {
+                return Ok(false);
+            }
+            (unwrap_parens(inner)?, true)
         }
-        None => matches!(
+        term => (term, false),
+    };
+    match index_expr {
+        // SQLite wraps an index expression in a COLLATE operator only when it
+        // has no COLLATE at its top, and the term goes through the same one
+        // COLLATE operator. A term without COLLATE skips each COLLATE at the
+        // top of the index expression.
+        Some(index_expr) => {
+            let mut index_expr = unwrap_parens(index_expr)?;
+            while let ast::Expr::Collate(inner, _) = index_expr {
+                index_expr = unwrap_parens(inner)?;
+                if term_has_collate {
+                    break;
+                }
+            }
+            Ok(exprs_are_equivalent_as_written(term, index_expr))
+        }
+        None => Ok(matches!(
             term,
             ast::Expr::Column { column, is_rowid_alias, .. }
                 if *column == index_column.pos_in_table
                     && (rowid_alias_is_column || !is_rowid_alias)
-        ),
-    }
-}
-
-/// Returns `expr` without the parentheses and COLLATE operators at its top,
-/// and the name of the outermost of these COLLATE operators.
-fn skip_parens_and_collate(mut expr: &ast::Expr) -> (&ast::Expr, Option<&ast::Name>) {
-    let mut collation = None;
-    loop {
-        match expr {
-            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => expr = &exprs[0],
-            ast::Expr::Collate(inner, name) => {
-                collation.get_or_insert(name);
-                expr = inner;
-            }
-            _ => return (expr, collation),
-        }
+        )),
     }
 }
 

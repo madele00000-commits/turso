@@ -1790,6 +1790,48 @@ expect error {
     ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
 }
 
+test upsert-target-with-two-collates-matches-no-expression {
+    CREATE TABLE u(a TEXT, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase);
+    INSERT INTO u VALUES ('A', 'old');
+    INSERT INTO u VALUES ('a', 'z') ON CONFLICT (lower(a) COLLATE binary COLLATE nocase) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+test upsert-target-with-two-collates-matches-no-column {
+    CREATE TABLE u(a TEXT, c, UNIQUE(a));
+    INSERT INTO u VALUES ('A', 'old');
+    INSERT INTO u VALUES ('A', 'z') ON CONFLICT (a COLLATE nocase COLLATE binary) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+test upsert-target-with-one-collate-matches-no-expression-with-two {
+    CREATE TABLE u(a TEXT, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase COLLATE binary);
+    INSERT INTO u VALUES ('A', 'old');
+    INSERT INTO u VALUES ('a', 'z') ON CONFLICT (lower(a) COLLATE binary) DO UPDATE SET c = 'new';
+}
+expect error {
+    ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+@cross-check-integrity
+test upsert-target-matches-expression-with-two-collates {
+    CREATE TABLE u(a TEXT, c);
+    CREATE UNIQUE INDEX ue ON u(lower(a) COLLATE nocase COLLATE binary);
+    INSERT INTO u VALUES ('A', 'old');
+    INSERT INTO u VALUES ('a', 'z') ON CONFLICT (lower(a) COLLATE nocase COLLATE binary) DO UPDATE SET c = 'new';
+    INSERT INTO u VALUES ('a', 'z') ON CONFLICT (lower(a)) DO UPDATE SET c = c || '!';
+    SELECT * FROM u;
+}
+expect {
+    A|new!
+}
+
 @cross-check-integrity
 test upsert-target-where-names-table-by-alias {
     CREATE TABLE p(a, b, c);
@@ -1962,4 +2004,21 @@ test upsert-target-before-catch-all-matches-nothing {
 }
 expect error {
     1st ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint
+}
+
+# The conflict target of an UPSERT in a trigger can name NEW. UNIQUE(a, a)
+# needs only the term a, but the term new.x must still resolve.
+@cross-check-integrity
+test upsert-target-in-trigger-names-new {
+    CREATE TABLE t(a, b, c, UNIQUE(a, a));
+    CREATE TABLE src(x);
+    INSERT INTO t VALUES (1, 2, 'o');
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN
+      INSERT INTO t VALUES (1, new.x, 'z') ON CONFLICT (a, new.x) DO UPDATE SET c = 'n';
+    END;
+    INSERT INTO src VALUES (5);
+    SELECT * FROM t;
+}
+expect {
+    1|2|n
 }
