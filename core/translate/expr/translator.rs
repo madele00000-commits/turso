@@ -1122,15 +1122,32 @@ fn translate_function_call_expr(
                     let env = TypeEnv::new(referenced_tables, resolver);
                     let written_types: Vec<ExprType> =
                         args.iter().map(|arg| type_of(arg, &env)).collect();
-                    if let Some(check) = external.func.check_argument_types() {
-                        let names: Vec<String> =
-                            written_types.iter().map(|ty| ty.to_string()).collect();
-                        check(&names)?;
-                    }
-                    written_types
+                    // A string literal is shown as text, but PostgreSQL gives it
+                    // the type unknown, and the check must tell it apart from a
+                    // text expression. Only the literal itself is unknown: a
+                    // CASE, subquery or view column made from literals is text.
+                    // Parentheses do not count, because PostgreSQL's parser
+                    // drops them.
+                    let written_names = written_types
+                        .iter()
+                        .zip(args.iter())
+                        .map(|(ty, arg)| {
+                            Ok(match unwrap_parens(arg)? {
+                                ast::Expr::Literal(ast::Literal::String(_)) => {
+                                    "unknown".to_string()
+                                }
+                                _ => ty.to_string(),
+                            })
+                        })
+                        .collect::<Result<Vec<String>>>()?;
+                    let base_names: Vec<String> = written_types
                         .into_iter()
                         .map(|ty| name_without_domains(ty, resolver.schema()))
-                        .collect()
+                        .collect();
+                    if let Some(check) = external.func.check_argument_types() {
+                        check(&written_names, &base_names)?;
+                    }
+                    base_names
                 }
                 _ => Vec::new(),
             };

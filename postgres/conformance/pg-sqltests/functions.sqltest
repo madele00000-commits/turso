@@ -3180,3 +3180,305 @@ test date-trunc-century-millennium-low-years {
 expect {
     0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0001-01-01 00:00:00+00|0010-01-01 00:00:00+00
 }
+
+test chr-ascii-and-multibyte {
+    SELECT chr(65), chr(233), octet_length(chr(233)), octet_length(chr(1114111));
+}
+expect {
+    A|é|2|4
+}
+
+test chr-null-is-null {
+    SELECT coalesce(chr(NULL), '<null>');
+}
+expect {
+    <null>
+}
+
+# The predicate is NULL for every row, so no row is deleted.
+test chr-null-in-not-in-deletes-nothing {
+    CREATE TABLE t1(c1 int);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    DELETE FROM t1 WHERE (chr(NULL) NOT IN ('a', (c1)::text));
+    SELECT count(*) FROM t1;
+}
+expect {
+    3
+}
+
+test chr-string-literal-is-read-as-integer {
+    SELECT chr('66'), chr(' 67 ');
+}
+expect {
+    B|C
+}
+
+test chr-zero-errors {
+    SELECT chr(0);
+}
+@sqlstate 54000
+expect error {
+    null character not permitted
+}
+
+test chr-negative-errors {
+    SELECT chr(-1);
+}
+@sqlstate 22023
+expect error {
+    character number must be positive
+}
+
+test chr-past-last-code-point-errors {
+    SELECT chr(1114112);
+}
+@sqlstate 54000
+expect error {
+    requested character too large for encoding: 1114112
+}
+
+test chr-surrogate-errors {
+    SELECT chr(55296);
+}
+@sqlstate 54000
+expect error {
+    requested character not valid for encoding: 55296
+}
+
+test chr-two-arguments-errors {
+    SELECT chr(65, 66);
+}
+@sqlstate 42883
+expect error {}
+
+test chr-no-arguments-errors {
+    SELECT chr();
+}
+@sqlstate 42883
+expect error {}
+
+test chr-bigint-errors {
+    SELECT chr(2147483648);
+}
+@sqlstate 42883
+expect error {
+    function chr\(bigint\) does not exist
+}
+
+test chr-numeric-errors {
+    SELECT chr(65.5);
+}
+@sqlstate 42883
+expect error {
+    function chr\(numeric\) does not exist
+}
+
+test chr-invalid-string-literal-errors {
+    SELECT chr('x');
+}
+@sqlstate 22P02
+expect error {
+    invalid input syntax for type integer: "x"
+}
+
+test chr-out-of-range-string-literal-errors {
+    SELECT chr('99999999999');
+}
+@sqlstate 22003
+expect error {
+    value "99999999999" is out of range for type integer
+}
+
+test chr-smallint-argument {
+    CREATE TABLE chr_small(s smallint);
+    INSERT INTO chr_small VALUES (68);
+    SELECT chr(s), chr(69::smallint) FROM chr_small;
+}
+expect {
+    D|E
+}
+
+test chr-boolean-errors {
+    SELECT chr(true);
+}
+@sqlstate 42883
+expect error {
+    function chr\(boolean\) does not exist
+}
+
+test chr-bigint-cast-errors {
+    SELECT chr(65::bigint);
+}
+@sqlstate 42883
+expect error {
+    function chr\(bigint\) does not exist
+}
+
+# PostgreSQL checks the type before the value, so a typed NULL fails too.
+test chr-null-text-errors {
+    SELECT chr(NULL::text);
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+# A string literal has the type unknown and is converted to integer, but a
+# text expression has the type text, which is not.
+test chr-text-expression-errors {
+    SELECT chr(lower('65'));
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+test chr-concatenation-errors {
+    SELECT chr('6' || '5');
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+# Only the string literal itself has the type unknown. A CASE, a scalar
+# subquery, nullif or a view column built from string literals is text.
+test chr-case-of-string-literal-errors {
+    SELECT chr(CASE WHEN true THEN '65' END);
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+test chr-subquery-of-string-literal-errors {
+    SELECT chr((SELECT '65'));
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+test chr-nullif-of-string-literal-errors {
+    SELECT chr(nullif('65', ''));
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+test chr-view-of-string-literal-errors {
+    CREATE VIEW chr_literal_view AS SELECT '65' AS s;
+    SELECT chr(s) FROM chr_literal_view;
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+test chr-parenthesized-string-literal {
+    SELECT chr(('65')), chr((('66')));
+}
+expect {
+    A|B
+}
+
+test chr-text-column-errors {
+    CREATE TABLE chr_text_rows(s text);
+    INSERT INTO chr_text_rows VALUES ('65');
+    SELECT chr(s) FROM chr_text_rows;
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+test chr-empty-text-table-errors {
+    CREATE TABLE chr_empty_text(s text);
+    SELECT chr(s) FROM chr_empty_text;
+}
+@sqlstate 42883
+expect error {
+    function chr\(text\) does not exist
+}
+
+test chr-real-errors {
+    SELECT chr(65::real);
+}
+@sqlstate 42883
+expect error {
+    function chr\(real\) does not exist
+}
+
+test chr-bigint-column-errors {
+    CREATE TABLE chr_bigint(b bigint);
+    INSERT INTO chr_bigint VALUES (65);
+    SELECT chr(b) FROM chr_bigint;
+}
+@sqlstate 42883
+expect error {
+    function chr\(bigint\) does not exist
+}
+
+test chr-boolean-column-errors {
+    CREATE TABLE chr_boolean(bo boolean);
+    INSERT INTO chr_boolean VALUES (true);
+    SELECT chr(bo) FROM chr_boolean;
+}
+@sqlstate 42883
+expect error {
+    function chr\(boolean\) does not exist
+}
+
+test chr-varchar-column-errors {
+    CREATE TABLE chr_varchar(v varchar(5));
+    INSERT INTO chr_varchar VALUES ('65');
+    SELECT chr(v) FROM chr_varchar;
+}
+@sqlstate 42883
+expect error {}
+
+test chr-double-precision-column-errors {
+    CREATE TABLE chr_double(d double precision);
+    INSERT INTO chr_double VALUES (65);
+    SELECT chr(d) FROM chr_double;
+}
+@sqlstate 42883
+expect error {}
+
+# PostgreSQL checks the argument type when it plans the statement, so the
+# call fails even when no row reaches it.
+test chr-empty-bigint-table-errors {
+    CREATE TABLE chr_empty_bigint(b bigint);
+    SELECT chr(b) FROM chr_empty_bigint;
+}
+@sqlstate 42883
+expect error {
+    function chr\(bigint\) does not exist
+}
+
+test chr-empty-boolean-table-errors {
+    CREATE TABLE chr_empty_boolean(b boolean);
+    SELECT count(*) FROM chr_empty_boolean WHERE chr(b) = 'A';
+}
+@sqlstate 42883
+expect error {
+    function chr\(boolean\) does not exist
+}
+
+test chr-integer-domain-argument {
+    CREATE DOMAIN chr_code AS integer;
+    SELECT chr(70::chr_code), coalesce(chr(NULL::chr_code), '<null>');
+}
+expect {
+    F|<null>
+}
+
+test chr-text-domain-errors {
+    CREATE DOMAIN chr_text AS text;
+    SELECT chr('65'::chr_text);
+}
+@sqlstate 42883
+expect error {
+    function chr\(chr_text\) does not exist
+}

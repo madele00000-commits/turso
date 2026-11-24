@@ -20,8 +20,9 @@ use turso_pg_parser::sqlstate::{
     SQLSTATE_INVALID_DATETIME_FORMAT, SQLSTATE_INVALID_ESCAPE_SEQUENCE,
     SQLSTATE_INVALID_PARAMETER_VALUE, SQLSTATE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE,
     SQLSTATE_INVALID_ROW_COUNT_IN_RESULT_OFFSET_CLAUSE, SQLSTATE_INVALID_TEXT_REPRESENTATION,
-    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_STATEMENT_TOO_COMPLEX,
-    SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT, SQLSTATE_UNTRANSLATABLE_CHARACTER,
+    SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE, SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+    SQLSTATE_STATEMENT_TOO_COMPLEX, SQLSTATE_UNDEFINED_FUNCTION, SQLSTATE_UNDEFINED_OBJECT,
+    SQLSTATE_UNTRANSLATABLE_CHARACTER,
 };
 
 /// Registers one native scalar function per name. Each body is a Rust
@@ -91,20 +92,47 @@ pub(crate) fn register_functions(options: OpenOptions) -> OpenOptions {
             // replaces this.
             .returning_first_argument_type(),
         )
+        .extension_function(
+            pg_scalar_function("chr", FunctionArity::Exact(1), true, |_, args| {
+                exec_chr(args)
+            })
+            .receiving_argument_types()
+            .checking_argument_types(check_chr_types),
+        )
+}
+
+/// Refuses an argument of chr() whose type PostgreSQL does not convert to
+/// integer. `types` are the argument type names as written, with domain names
+/// kept and `unknown` for a string literal, and `base_types` the same names
+/// with domains replaced: a domain over integer or smallint is accepted, as
+/// in PostgreSQL, but a domain over text is not.
+// FIXME(pg-catalog): PostgreSQL finds chr(integer) in pg_proc and converts
+// only an integer, a smallint, a literal of type unknown or NULL to integer
+// (the implicit casts of pg_cast). This match hand-codes that list. A pg_proc
+// and pg_cast lookup replaces it. The type names also come from Turso, which
+// names the result of count(), sum() and integer arithmetic with a bigint
+// integer, where PostgreSQL types it bigint, so this accepts them. An
+// expression tree that carries PostgreSQL types fixes that.
+fn check_chr_types(types: &[String], base_types: &[String]) -> Result<()> {
+    match (types[0].as_str(), base_types[0].as_str()) {
+        ("unknown", _) | (_, "integer" | "smallint" | "null" | "any" | "unknown") => Ok(()),
+        (written, _) => Err(undefined_function("chr", &[written])),
+    }
 }
 
 /// Refuses the left side of `+ interval` when it is not timestamp or
-/// timestamptz. `types` are the argument type names, with domain names kept;
-/// the first is the left side, so a domain over timestamp or timestamptz is
-/// refused. Every other type gets 0A000, including the ones that have no operator
-/// in PostgreSQL (which gives 42883), because the type name does not say
-/// whether PostgreSQL has one. The translator turns `-` into `+` of the
-/// negated interval, so the message always says `+`.
+/// timestamptz. `types` are the argument type names as written, with domain
+/// names kept and `unknown` for a string literal; the first is the left side,
+/// so a domain over timestamp or timestamptz is refused. `_base_types` are the
+/// same names with domains replaced. Every other type gets 0A000, including
+/// the ones that have no operator in PostgreSQL (which gives 42883), because
+/// the type name does not say whether PostgreSQL has one. The translator
+/// turns `-` into `+` of the negated interval, so the message always says `+`.
 // FIXME(pg-catalog): tursopg refuses every other left type with 0A000 because
 // it cannot tell which have a PostgreSQL operator. Some do, such as date, and
 // an untyped literal or NULL is resolved by PostgreSQL to a type that does. A
 // pg_operator lookup replaces this.
-fn check_timestamp_plus_interval_types(types: &[String]) -> Result<()> {
+fn check_timestamp_plus_interval_types(types: &[String], _base_types: &[String]) -> Result<()> {
     let time_type = types[0].as_str();
     match time_type {
         "timestamp" | "timestamptz" => Ok(()),
@@ -859,6 +887,67 @@ fn unrecognized_parameter(name: &str) -> LimboError {
 fn exec_random(bits: i64) -> f64 {
     let mantissa = (bits as u64) >> 11;
     mantissa as f64 / (1_u64 << 53) as f64
+}
+
+/// chr(integer): the character with code point `code`. A NULL argument gives
+/// NULL, unlike SQLite's char(), which reads it as code point 0.
+fn exec_chr(args: &[Register]) -> Result<Option<String>> {
+    // Registered with arity 1; the argument is followed by its type.
+    let [code, _code_type] = args else {
+        unreachable!("chr is registered with one argument and its type");
+    };
+    // check_chr_types accepted the type when the statement was compiled. A
+    // parameter has the type any, and an expression whose type the planner
+    // cannot work out has the type unknown, so their values are checked here.
+    let code = match code.get_value() {
+        Value::Null => return Ok(None),
+        Value::Numeric(Numeric::Integer(code)) => {
+            i32::try_from(*code).map_err(|_| undefined_function("chr", &["bigint"]))?
+        }
+        // A string literal is converted to the integer argument type.
+        Value::Text(text) => {
+            if let Some((message, sqlstate)) = validate_pg_input(text.as_str(), "int4") {
+                return Err(sqlstate_error(sqlstate, message, None));
+            }
+            text.as_str()
+                .trim()
+                .parse()
+                .expect("validate_pg_input accepted the text as an integer")
+        }
+        other => return Err(undefined_function("chr", &[pg_type_name(other)])),
+    };
+    if code < 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "character number must be positive",
+            None,
+        ));
+    }
+    if code == 0 {
+        return Err(sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            "null character not permitted",
+            None,
+        ));
+    }
+    let code = code as u32;
+    if code > char::MAX as u32 {
+        return Err(sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            format!("requested character too large for encoding: {code}"),
+            None,
+        ));
+    }
+    // The only code points up to char::MAX that are not characters are the
+    // UTF-16 surrogates.
+    let character = char::from_u32(code).ok_or_else(|| {
+        sqlstate_error(
+            SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+            format!("requested character not valid for encoding: {code}"),
+            None,
+        )
+    })?;
+    Ok(Some(character.to_string()))
 }
 
 /// Converts a LIMIT or OFFSET value to bigint the way PostgreSQL does, rounding
@@ -2052,7 +2141,7 @@ fn pg_type_name(value: &Value) -> &'static str {
 ///
 /// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
 /// Used by both `pg_input_error_info` (table-valued) and `pg_input_is_valid` (scalar).
-pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, String)> {
+pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, &'static str)> {
     let trimmed = input.trim();
 
     // Extract base type and optional length modifier, e.g. "varchar(4)" → ("varchar", Some(4))
@@ -2073,30 +2162,30 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type boolean: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
         "int2" | "smallint" => match trimmed.parse::<i64>() {
             Ok(v) if v < i16::MIN as i64 || v > i16::MAX as i64 => Some((
                 format!("value \"{input}\" is out of range for type smallint"),
-                "22003".to_string(),
+                "22003",
             )),
             Ok(_) => None,
             Err(_) => Some((
                 format!("invalid input syntax for type smallint: \"{input}\""),
-                "22P02".to_string(),
+                "22P02",
             )),
         },
         "int4" | "integer" | "int" => match trimmed.parse::<i64>() {
             Ok(v) if v < i32::MIN as i64 || v > i32::MAX as i64 => Some((
                 format!("value \"{input}\" is out of range for type integer"),
-                "22003".to_string(),
+                "22003",
             )),
             Ok(_) => None,
             Err(_) => Some((
                 format!("invalid input syntax for type integer: \"{input}\""),
-                "22P02".to_string(),
+                "22P02",
             )),
         },
         "int8" | "bigint" => match trimmed.parse::<i64>() {
@@ -2105,12 +2194,12 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 if trimmed.parse::<i128>().is_ok() {
                     Some((
                         format!("value \"{input}\" is out of range for type bigint"),
-                        "22003".to_string(),
+                        "22003",
                     ))
                 } else {
                     Some((
                         format!("invalid input syntax for type bigint: \"{input}\""),
-                        "22P02".to_string(),
+                        "22P02",
                     ))
                 }
             }
@@ -2118,34 +2207,34 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         "float4" | "real" => match trimmed.parse::<f32>() {
             Ok(v) if v.is_infinite() => Some((
                 format!("value \"{input}\" is out of range for type real"),
-                "22003".to_string(),
+                "22003",
             )),
             Ok(_) => None,
             Err(_) => Some((
                 format!("invalid input syntax for type real: \"{input}\""),
-                "22P02".to_string(),
+                "22P02",
             )),
         },
         "float8" | "double precision" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_infinite() => Some((
                 format!("value \"{input}\" is out of range for type double precision"),
-                "22003".to_string(),
+                "22003",
             )),
             Ok(_) => None,
             Err(_) => Some((
                 format!("invalid input syntax for type double precision: \"{input}\""),
-                "22P02".to_string(),
+                "22P02",
             )),
         },
         "numeric" | "decimal" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_nan() || v.is_infinite() => Some((
                 format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
+                "22P02",
             )),
             Ok(_) => None,
             Err(_) => Some((
                 format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
+                "22P02",
             )),
         },
         "text" => None,
@@ -2154,7 +2243,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 if trimmed.chars().count() > max_len {
                     return Some((
                         format!("value too long for type character varying({max_len})"),
-                        "22001".to_string(),
+                        "22001",
                     ));
                 }
             }
@@ -2165,7 +2254,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 if trimmed.chars().count() > max_len {
                     return Some((
                         format!("value too long for type character({max_len})"),
-                        "22001".to_string(),
+                        "22001",
                     ));
                 }
             }
@@ -2176,7 +2265,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 Some((
                     format!("invalid input syntax for type uuid: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             } else {
                 None
@@ -2197,7 +2286,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 };
                 Some((
                     format!("invalid input syntax for type {type_label}: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
@@ -2209,7 +2298,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 } else {
                     Some((
                         format!("invalid input syntax for type bytea: \"{input}\""),
-                        "22P02".to_string(),
+                        "22P02",
                     ))
                 }
             } else {
@@ -2226,7 +2315,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                     if prefix_str.parse::<u8>().is_err() {
                         return Some((
                             format!("invalid input syntax for type {base_type}: \"{input}\""),
-                            "22P02".to_string(),
+                            "22P02",
                         ));
                     }
                 }
@@ -2234,7 +2323,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type {base_type}: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
@@ -2249,7 +2338,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type macaddr: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
@@ -2259,14 +2348,11 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type oid: \"{input}\""),
-                    "22P02".to_string(),
+                    "22P02",
                 ))
             }
         }
-        _ => Some((
-            format!("type \"{type_name}\" does not exist"),
-            "42704".to_string(),
-        )),
+        _ => Some((format!("type \"{type_name}\" does not exist"), "42704")),
     }
 }
 
@@ -2291,17 +2377,15 @@ pub fn parse_pg_bool(text: &str) -> Option<bool> {
 
 /// Reads `input` as the date or time type `type_name` does when it stores a
 /// value, so `pg_input_is_valid` and the type agree on what is valid.
-fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String, String)> {
+fn check_temporal_input(input: &str, type_name: &'static str) -> Option<(String, &'static str)> {
     match exec_temporal_encode(
         &Value::build_text(input.to_string()),
         &Value::build_text(type_name),
     ) {
         Ok(_) => None,
-        Err(LimboError::InvalidDate(message)) => {
-            Some((message, SQLSTATE_INVALID_DATETIME_FORMAT.to_string()))
-        }
+        Err(LimboError::InvalidDate(message)) => Some((message, SQLSTATE_INVALID_DATETIME_FORMAT)),
         Err(LimboError::DatetimeFieldOverflow(message)) => {
-            Some((message, SQLSTATE_DATETIME_FIELD_OVERFLOW.to_string()))
+            Some((message, SQLSTATE_DATETIME_FIELD_OVERFLOW))
         }
         Err(other) => unreachable!("temporal_encode of text failed with {other}"),
     }

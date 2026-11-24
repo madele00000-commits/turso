@@ -127,9 +127,8 @@ pub enum ExtFunc {
         /// Whether a call also gets the type name of each argument, such as
         /// `boolean[]`, as one more text argument per argument, after them.
         receives_argument_types: bool,
-        /// Called at compile time with the type name of each argument, with
-        /// domain names kept, where `receives_argument_types` passes the
-        /// domain's base type; an error refuses the statement.
+        /// Called at compile time with the type names of the arguments, as
+        /// [`ArgumentTypeCheck`] describes; an error refuses the statement.
         check_argument_types: Option<ArgumentTypeCheck>,
         /// Whether the result has the type of the first argument, instead of
         /// `return_type`.
@@ -142,9 +141,11 @@ pub enum ExtFunc {
     },
 }
 
-/// A function called at compile time with the type name of each argument,
-/// with domain names kept; an error refuses the statement.
-pub type ArgumentTypeCheck = fn(&[String]) -> crate::Result<()>;
+/// A function called at compile time with the type name of each argument
+/// twice: first as written, with domain names kept and with `unknown` for a
+/// string literal, then with each domain replaced by its base type, as
+/// `receives_argument_types` passes them. An error refuses the statement.
+pub type ArgumentTypeCheck = fn(&[String], &[String]) -> crate::Result<()>;
 
 #[derive(Debug)]
 pub struct ExternalContext {

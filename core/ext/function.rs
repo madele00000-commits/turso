@@ -54,11 +54,11 @@ impl ExternalFunc {
         self
     }
 
-    /// Sets a function that is called at compile time with the type name of
-    /// each argument, with domain names kept (`receiving_argument_types`
-    /// passes the domain's base type); an error refuses the statement. Needs
+    /// Sets a function that is called at compile time with the type names of
+    /// the arguments, with domain names kept and with domains replaced by
+    /// their base types; an error refuses the statement. Needs
     /// `receiving_argument_types`.
-    // FIXME(pg-catalog): only pg_timestamp_plus_interval sets this. It stands in
+    // FIXME(pg-catalog): only pg_timestamp_plus_interval and chr set this. It stands in
     // for PostgreSQL resolving an operator or function by its argument types
     // from pg_operator or pg_proc when it plans the statement. A pg_proc and
     // pg_operator lookup replaces this; remove it if that lookup does not use it.
