@@ -351,7 +351,12 @@ fn bind_upsert_target(
             Ok(WalkControl::Continue)
         })?;
     }
-    let target_where = target.where_clause.as_ref().and_then(|_| exprs.pop());
+    let target_where = target
+        .where_clause
+        .as_ref()
+        .and_then(|_| exprs.pop())
+        .map(rowid_alias_as_rowid)
+        .transpose()?;
     Ok((exprs, target_where))
 }
 
@@ -379,7 +384,7 @@ fn upsert_matches_index(
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
-        Ok(expr)
+        rowid_alias_as_rowid(expr)
     };
     let partial_index_predicate_matches = match (&index.where_clause, target_where) {
         (Some(index_where), Some(target_where)) => {
@@ -463,7 +468,10 @@ fn target_term_matches_index_column(
                     break;
                 }
             }
-            Ok(exprs_are_equivalent_as_written(term, index_expr))
+            Ok(exprs_are_equivalent_as_written(
+                &rowid_alias_as_rowid(term.clone())?,
+                index_expr,
+            ))
         }
         None => Ok(matches!(
             term,
@@ -472,6 +480,32 @@ fn target_term_matches_index_column(
                     && (rowid_alias_is_column || !is_rowid_alias)
         )),
     }
+}
+
+/// Returns the bound `expr` with each reference to the INTEGER PRIMARY KEY
+/// column replaced by the rowid. In an expression SQLite resolves both names to
+/// the rowid, so `b + 0` and `rowid + 0` compare equal when `b` is the INTEGER
+/// PRIMARY KEY.
+fn rowid_alias_as_rowid(mut expr: ast::Expr) -> crate::Result<ast::Expr> {
+    walk_expr_mut(
+        &mut expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            if let ast::Expr::Column {
+                database,
+                table,
+                is_rowid_alias: true,
+                ..
+            } = e
+            {
+                *e = ast::Expr::RowId {
+                    database: *database,
+                    table: *table,
+                };
+            }
+            Ok(WalkControl::Continue)
+        },
+    )?;
+    Ok(expr)
 }
 
 #[allow(clippy::too_many_arguments)]

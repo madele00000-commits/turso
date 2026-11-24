@@ -1642,6 +1642,28 @@ expect {
 
 @setup upsert_target_dup
 @cross-check-integrity
+test upsert-target-rowid-in-term-matches-integer-primary-key-in-index-expression {
+    CREATE UNIQUE INDEX i2 ON t(n, b + 0);
+    INSERT INTO t(n, b) VALUES (5, -1) ON CONFLICT (n, rowid + 0) DO UPDATE SET c = 'new';
+    SELECT * FROM t;
+}
+expect {
+    -1|5|new
+}
+
+@setup upsert_target_dup
+@cross-check-integrity
+test upsert-target-rowid-in-where-matches-integer-primary-key-in-index-where {
+    CREATE UNIQUE INDEX i2 ON t(n) WHERE b < 0;
+    INSERT INTO t(n, b) VALUES (5, -2) ON CONFLICT (n) WHERE rowid < 0 DO UPDATE SET c = 'new';
+    SELECT * FROM t;
+}
+expect {
+    -1|5|new
+}
+
+@setup upsert_target_dup
+@cross-check-integrity
 test upsert-target-rowid-names-integer-primary-key {
     INSERT INTO t(n, b) VALUES (6, -1) ON CONFLICT (rowid) DO UPDATE SET c = 'new';
     INSERT INTO t(n, b) VALUES (7, -1) ON CONFLICT (_rowid_) DO UPDATE SET c = c || '2';
@@ -1911,6 +1933,41 @@ expect error {
     wrong number of arguments to function abs()
 }
 
+# SQLite checks the argument count when it resolves the name, also for
+# functions that take a variable count with a minimum, and for math and
+# JSON functions.
+@setup upsert_target_names
+test upsert-target-term-with-too-few-arguments-to-variadic-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, coalesce(b)) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function coalesce()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-wrong-argument-count-to-math-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, sqrt(b, 1)) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function sqrt()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-wrong-argument-count-to-json-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, json_array_length()) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function json_array_length()
+}
+
+@setup upsert_target_names
+test upsert-target-term-with-subquery-with-wrong-argument-count {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, (SELECT iif(1))) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function iif()
+}
+
 @setup upsert_target_names
 test upsert-target-term-with-subquery-on-unknown-column {
     INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a, (SELECT zz)) DO UPDATE SET c = 'new';
@@ -1972,6 +2029,22 @@ test upsert-target-where-with-wrong-argument-count {
 }
 expect error {
     wrong number of arguments to function abs()
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-wrong-argument-count-to-math-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE pi(1) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function pi()
+}
+
+@setup upsert_target_where_names
+test upsert-target-where-with-too-few-arguments-to-variadic-function {
+    INSERT INTO t VALUES (1, 3, 'z') ON CONFLICT (a) WHERE concat_ws(b) DO UPDATE SET c = 'new';
+}
+expect error {
+    wrong number of arguments to function concat_ws()
 }
 
 @setup upsert_target_where_names
