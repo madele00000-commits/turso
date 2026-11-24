@@ -348,7 +348,7 @@ pub fn translate_insert(
     }
     let BoundInsertResult {
         mut values,
-        mut upsert_actions,
+        upserts,
         inserting_multiple_rows,
     } = bind_insert(
         program,
@@ -357,7 +357,6 @@ pub fn translate_insert(
         &columns,
         &mut body,
         on_conflict.unwrap_or(ResolveType::Abort),
-        namespace,
     )?;
 
     let is_mvcc = connection.mv_store_for_db(database_id).is_some();
@@ -404,7 +403,17 @@ pub fn translate_insert(
             collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
         }
     }
-    for (_, _, upsert) in &upsert_actions {
+    for upsert in &upserts {
+        if let Some(target) = &upsert.index {
+            for expr in target
+                .targets
+                .iter()
+                .map(|term| &term.expr)
+                .chain(&target.where_clause)
+            {
+                collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
+            }
+        }
         if let UpsertDo::Set { sets, where_clause } = &upsert.do_clause {
             for expr in sets.iter().map(|set| &set.expr).chain(where_clause) {
                 collect_subquery_table_refs_in_expr(expr, &mut subquery_table_refs);
@@ -419,6 +428,22 @@ pub fn translate_insert(
         &mut table_references,
         connection,
     )?;
+
+    // Resolve the constraint each ON CONFLICT clause names.
+    let clause_count = upserts.len();
+    let mut upsert_actions = Vec::with_capacity(clause_count);
+    for (position, upsert) in upserts.into_iter().enumerate() {
+        let target = resolve_upsert_target(
+            program,
+            resolver,
+            connection,
+            &table_references,
+            tbl_name.alias.as_ref().map(|alias| alias.as_str()),
+            &upsert,
+            (clause_count > 1).then_some(position + 1),
+        )?;
+        upsert_actions.push((target, program.allocate_label(), upsert));
+    }
 
     let updates_on_conflict = upsert_actions
         .iter()
@@ -2177,7 +2202,9 @@ fn check_upsert_privileges(
 struct BoundInsertResult {
     #[allow(clippy::vec_box)]
     values: Vec<Box<Expr>>,
-    upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)>,
+    /// The ON CONFLICT clauses, in order.
+    #[allow(clippy::vec_box)]
+    upserts: Vec<Box<Upsert>>,
     inserting_multiple_rows: bool,
 }
 
@@ -2315,11 +2342,10 @@ fn bind_insert(
     columns: &[ast::Name],
     body: &mut InsertBody,
     on_conflict: ResolveType,
-    namespace: NamespaceRef,
 ) -> Result<BoundInsertResult> {
     let mut values: Vec<Box<Expr>> = vec![];
     let mut upsert: Option<Box<Upsert>> = None;
-    let mut upsert_actions: Vec<(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)> = Vec::new();
+    let mut upserts: Vec<Box<Upsert>> = Vec::new();
     let mut inserting_multiple_rows = false;
     match body {
         InsertBody::DefaultValues => {
@@ -2438,19 +2464,12 @@ fn bind_insert(
             }
         }
         let next = upsert_opt.next.take();
-        upsert_actions.push((
-            // resolve the constrained target for UPSERT in the chain
-            resolver.with_schema(namespace.database_id, |s| {
-                resolve_upsert_target(s, namespace.id, table, &upsert_opt)
-            })?,
-            program.allocate_label(),
-            upsert_opt,
-        ));
+        upserts.push(upsert_opt);
         upsert = next;
     }
     Ok(BoundInsertResult {
         values,
-        upsert_actions,
+        upserts,
         inserting_multiple_rows,
     })
 }
