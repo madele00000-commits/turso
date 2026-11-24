@@ -929,6 +929,14 @@ expect error {
 }
 
 @setup comma_and_join
+test join-on-after-a-comma-cannot-read-a-schema-qualified-table-before-the-comma {
+    SELECT * FROM ca, cb JOIN cc ON public.ca.x < cc.z;
+}
+@sqlstate 42P01
+expect error {
+}
+
+@setup comma_and_join
 test left-join-on-after-a-comma-cannot-read-a-table-before-the-comma {
     SELECT * FROM ca, cb LEFT JOIN cc ON ca.x < cc.z;
 }
